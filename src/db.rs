@@ -10,8 +10,15 @@ pub async fn connect(config: &DatabaseConfig) -> anyhow::Result<PgPool> {
         .max_connections(config.max_connections)
         .acquire_timeout(Duration::from_secs(5))
         .connect(&config.url)
-        .await?;
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to connect to PostgreSQL");
+            e
+        })?;
 
-    tracing::info!("Connected to PostgreSQL database");
+    tracing::info!(
+        max_connections = config.max_connections,
+        "Connected to PostgreSQL database"
+    );
     Ok(pool)
 }

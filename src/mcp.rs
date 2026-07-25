@@ -111,6 +111,7 @@ impl MorphisMCPServer {
         &self,
         Parameters(args): Parameters<DiscoverTablesArgs>,
     ) -> Result<CallToolResult, McpError> {
+        tracing::debug!(detail = args.detail, "MCP discover_tables called");
         let mut tables = serde_json::Map::new();
         for name in self.config.tables.keys() {
             if let Some(info) = self.col_info(name) {
@@ -222,10 +223,12 @@ impl MorphisMCPServer {
     #[tool(
         description = "Execute any GraphQL query against the API. Supports nested relations, filtering, pagination, and mutations. Example: { materialsList(limit: 3) { mat_no name sizes { size_code } } }"
     )]
+    #[tracing::instrument(skip(self), fields(query_preview = %args.query.chars().take(80).collect::<String>()))]
     async fn graphql(
         &self,
         Parameters(args): Parameters<GraphqlArgs>,
     ) -> Result<CallToolResult, McpError> {
+        tracing::info!(query_preview = %args.query.chars().take(80).collect::<String>(), "MCP graphql query");
         let url = format!("http://localhost:{}/graphql", self.config.server.port);
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -258,6 +261,10 @@ impl MorphisMCPServer {
         // Surface GraphQL errors as tool errors so the LLM gets clear feedback
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
             if let Some(errors) = parsed.get("errors") {
+                tracing::warn!(
+                    errors = %serde_json::to_string_pretty(errors).unwrap_or_default(),
+                    "MCP graphql returned errors"
+                );
                 return Err(McpError::internal_error(
                     format!(
                         "GraphQL errors: {}",
@@ -283,8 +290,10 @@ impl MorphisMCPServer {
     async fn graphql_schema(&self) -> Result<CallToolResult, McpError> {
         // Return cached result — schema is static at runtime
         if let Some(cached) = SCHEMA_CACHE.get() {
+            tracing::trace!("MCP graphql_schema cache hit");
             return Ok(CallToolResult::success(vec![Content::text(cached.clone())]));
         }
+        tracing::debug!("MCP graphql_schema: building schema (cache miss)");
 
         let url = format!("http://localhost:{}/graphql", self.config.server.port);
         let introspect_query = r#"
@@ -453,6 +462,7 @@ impl ServerHandler for MorphisMCPServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         if self.get_tool(&request.name).is_none() {
+            tracing::warn!(tool = %request.name, "MCP call_tool: unknown tool");
             return Err(McpError::invalid_params(
                 format!("Tool '{}' not found", request.name),
                 None::<serde_json::Value>,
@@ -545,6 +555,7 @@ async fn mcp_auth_middleware(
                                     }
                                 }
                             }
+                            tracing::trace!("MCP auth succeeded");
                             Identity::from_raw(headers)
                         }
                         Err(e) => {
@@ -601,7 +612,10 @@ async fn validate_jwt(
 ) -> Result<serde_json::Value, String> {
     use jsonwebtoken::decode_header;
 
-    let header = decode_header(token).map_err(|e| format!("JWT header decode failed: {}", e))?;
+    let header = decode_header(token).map_err(|e| {
+        tracing::warn!(error = %e, "MCP JWT header decode failed");
+        format!("JWT header decode failed: {}", e)
+    })?;
     let kid = header.kid.clone();
 
     if let Some(ref secret) = auth.jwt_secret {
@@ -619,12 +633,20 @@ async fn validate_jwt(
             &DecodingKey::from_secret(secret.as_bytes()),
             &validation,
         )
-        .map_err(|e| format!("JWT validation failed: {}", e))?;
+        .map_err(|e| {
+            tracing::warn!(error = %e, "MCP JWT HS256 validation failed");
+            format!("JWT validation failed: {}", e)
+        })?;
         Ok(data.claims)
     } else if let Some(ref jwks_url) = auth.jwks_url {
-        let jwks = fetch_jwks(jwks_url, jwks_breaker).await?;
-        let key = find_key(&jwks, kid.as_deref())
-            .ok_or_else(|| "No matching JWK key found".to_string())?;
+        let jwks = fetch_jwks(jwks_url, jwks_breaker).await.map_err(|e| {
+            tracing::error!(url = %jwks_url, error = %e, "Failed to fetch JWKS");
+            e
+        })?;
+        let key = find_key(&jwks, kid.as_deref()).ok_or_else(|| {
+            tracing::warn!(kid = ?kid, "No matching JWK key found");
+            "No matching JWK key found".to_string()
+        })?;
 
         let decoding_key = jwk_to_decoding_key(key)?;
         let mut validation = Validation::new(header.alg);
@@ -637,9 +659,13 @@ async fn validate_jwt(
         validation.validate_exp = true;
 
         let data = jsonwebtoken::decode::<serde_json::Value>(token, &decoding_key, &validation)
-            .map_err(|e| format!("JWT validation failed: {}", e))?;
+            .map_err(|e| {
+                tracing::warn!(error = %e, "MCP JWT JWKS validation failed");
+                format!("JWT validation failed: {}", e)
+            })?;
         Ok(data.claims)
     } else {
+        tracing::warn!("MCP JWT: no jwt_secret or jwks_url configured");
         Err("No jwt_secret or jwks_url configured".into())
     }
 }
@@ -653,17 +679,20 @@ async fn fetch_jwks(
         Some(cb) => cb
             .call(|| async { client.get(url).send().await })
             .await
-            .map_err(|e| e.to_string())?,
-        None => client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| format!("JWKS fetch failed: {}", e))?,
+            .map_err(|e| {
+                tracing::warn!(error = %e, "MCP JWKS fetch failed (circuit breaker)");
+                e.to_string()
+            })?,
+        None => client.get(url).send().await.map_err(|e| {
+            tracing::warn!(error = %e, "MCP JWKS fetch failed");
+            format!("JWKS fetch failed: {}", e)
+        })?,
     };
     let body = body
         .text()
         .await
         .map_err(|e| format!("JWKS body read failed: {}", e))?;
+    tracing::debug!(url = %url, "Fetched JWKS keys");
     serde_json::from_str(&body).map_err(|e| format!("JWKS parse failed: {}", e))
 }
 
@@ -810,9 +839,10 @@ fn extract_type_name(field: &serde_json::Value) -> String {
 
 fn resolve_named_type(t: &serde_json::Value) -> String {
     if let Some(name) = t["name"].as_str()
-        && !name.is_empty() {
-            return name.to_string();
-        }
+        && !name.is_empty()
+    {
+        return name.to_string();
+    }
     if let Some(of) = t["ofType"].as_object() {
         return resolve_named_type(&serde_json::Value::Object(of.clone()));
     }

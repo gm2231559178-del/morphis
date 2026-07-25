@@ -99,6 +99,13 @@ async fn es_search(
     identity: Option<&Identity>,
     row_filters: &[RowFilterConfig],
 ) -> Result<Vec<serde_json::Value>, async_graphql::Error> {
+    tracing::debug!(
+        index = %index_cfg.index,
+        query = %query_str.chars().take(80).collect::<String>(),
+        limit,
+        offset,
+        "ES search called"
+    );
     let (es_client, es_url, es_cb) = match (
         &app_ctx.es_client,
         &app_ctx.es_url,
@@ -116,9 +123,8 @@ async fn es_search(
                 "Raw ES queries not enabled for this index",
             ));
         }
-        let raw_query: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
-            async_graphql::Error::new(format!("Invalid esQuery JSON: {}", e))
-        })?;
+        let raw_query: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|e| async_graphql::Error::new(format!("Invalid esQuery JSON: {}", e)))?;
         let mut must = vec![raw_query];
         must.extend(filter_clauses);
         serde_json::json!({ "must": must })
@@ -343,10 +349,7 @@ fn es_batch_enrich<'a>(
             if keys.is_empty() {
                 for source in sources.iter_mut() {
                     if let Some(obj) = source.as_object_mut() {
-                        obj.insert(
-                            jf.index_field.clone(),
-                            serde_json::Value::Array(vec![]),
-                        );
+                        obj.insert(jf.index_field.clone(), serde_json::Value::Array(vec![]));
                     }
                 }
                 continue;
@@ -357,10 +360,12 @@ fn es_batch_enrich<'a>(
                 jf.table, jf.foreign_field
             );
             let mut all_children: Vec<serde_json::Value> =
-                db::fetch_joined_rows_batch(pool, &sql, &keys).await.unwrap_or_else(|e| {
-                    tracing::warn!("ES batch enrichment query failed: {:?}", e);
-                    vec![]
-                });
+                db::fetch_joined_rows_batch(pool, &sql, &keys)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("ES batch enrichment query failed: {:?}", e);
+                        vec![]
+                    });
 
             if !jf.join_fields.is_empty() {
                 es_batch_enrich(pool, &mut all_children, &jf.join_fields).await?;
@@ -368,10 +373,7 @@ fn es_batch_enrich<'a>(
 
             let mut grouped: HashMap<&str, Vec<serde_json::Value>> = HashMap::new();
             for child in &all_children {
-                if let Some(v) = child
-                    .get(&jf.foreign_field)
-                    .and_then(|v| v.as_str())
-                {
+                if let Some(v) = child.get(&jf.foreign_field).and_then(|v| v.as_str()) {
                     grouped.entry(v).or_default().push(child.clone());
                 }
             }

@@ -8,7 +8,7 @@ use pingora::proxy::{ProxyHttp, Session};
 use pingora::server::Server;
 use pingora::upstreams::peer::HttpPeer;
 use serde::Deserialize;
-use tracing::info;
+use tracing::{debug, info, trace, warn};
 
 use crate::config::ProxyConfig;
 
@@ -78,7 +78,7 @@ impl ProxyHttp for AuthProxy {
             Some(h) if h.starts_with("Bearer ") => h.trim_start_matches("Bearer ").trim(),
             _ => {
                 if self.config.require_auth {
-                    info!("Missing or invalid Authorization header");
+                    debug!("Missing or invalid Authorization header");
                     session.respond_error(401).await?;
                     return Ok(true);
                 }
@@ -111,13 +111,13 @@ impl ProxyHttp for AuthProxy {
                         match decode::<Claims>(token, key, &hs_validation) {
                             Ok(data) => data.claims,
                             Err(e) => {
-                                info!("JWT validation failed with JWKS and HS256: {}", e);
+                                warn!(error = %e, "JWT validation failed with JWKS and HS256");
                                 session.respond_error(401).await?;
                                 return Ok(true);
                             }
                         }
                     } else {
-                        info!("JWT validation failed with all JWKS keys (no HS256 fallback)");
+                        warn!("JWT validation failed with all JWKS keys (no HS256 fallback)");
                         session.respond_error(401).await?;
                         return Ok(true);
                     }
@@ -130,17 +130,18 @@ impl ProxyHttp for AuthProxy {
             match decode::<Claims>(token, key, &validation) {
                 Ok(data) => data.claims,
                 Err(e) => {
-                    info!("JWT validation failed: {}", e);
+                    warn!(error = %e, "JWT validation failed");
                     session.respond_error(401).await?;
                     return Ok(true);
                 }
             }
         } else {
-            info!("No JWT validation keys configured");
+            tracing::error!("No JWT validation keys configured");
             session.respond_error(500).await?;
             return Ok(true);
         };
 
+        trace!("Auth proxy: request authenticated successfully");
         for mapping in &self.config.header_mappings {
             if let Some(val) = Self::header_value_from_claims(&claims, &mapping.claim) {
                 let name = mapping.header.clone();
@@ -159,17 +160,18 @@ fn fetch_jwks(url: &str) -> anyhow::Result<Vec<DecodingKey>> {
     for jwk in &jwk_set.keys {
         // Only use signing keys, skip encryption keys
         if let Some(ref use_val) = jwk.common.public_key_use
-            && !matches!(use_val, PublicKeyUse::Signature) {
-                info!(
-                    "Skipping JWK (kid: {:?}) with non-signature use",
-                    jwk.common.key_id
-                );
-                continue;
-            }
+            && !matches!(use_val, PublicKeyUse::Signature)
+        {
+            debug!(
+                kid = ?jwk.common.key_id,
+                "Skipping JWK with non-signature use"
+            );
+            continue;
+        }
         match DecodingKey::from_jwk(jwk) {
             Ok(key) => keys.push(key),
             Err(e) => {
-                info!("Skipping JWK (kid: {:?}): {}", jwk.common.key_id, e);
+                debug!(kid = ?jwk.common.key_id, error = %e, "Skipping JWK");
             }
         }
     }

@@ -19,7 +19,11 @@ pub(crate) async fn fetch_one(
                 .map_err(|e| async_graphql::Error::new(e.to_string()))
         }
         Ok(None) => Ok(None),
-        Err(e) => Err(async_graphql::Error::new(e.to_string())),
+        Err(e) => {
+            let msg = e.to_string();
+            tracing::error!(error = %msg, sql_preview = %sql.chars().take(200).collect::<String>(), "DB fetch_one failed");
+            Err(async_graphql::Error::new(e.to_string()))
+        }
     }
 }
 
@@ -44,7 +48,11 @@ pub(crate) async fn fetch_many(
                 _ => Ok(vec![val]),
             }
         }
-        Err(e) => Err(async_graphql::Error::new(e.to_string())),
+        Err(e) => {
+            let msg = e.to_string();
+            tracing::error!(error = %msg, sql_preview = %sql.chars().take(200).collect::<String>(), "DB fetch_many failed");
+            Err(async_graphql::Error::new(e.to_string()))
+        }
     }
 }
 
@@ -70,10 +78,14 @@ pub(crate) async fn fetch_joined_rows_batch(
             }
         }
         Ok(None) => Ok(vec![]),
-        Err(e) => Err(async_graphql::Error::new(format!(
-            "batch fetch query failed: {}",
-            e
-        ))),
+        Err(e) => {
+            let msg = e.to_string();
+            tracing::error!(error = %msg, sql_preview = %sql.chars().take(200).collect::<String>(), key_count = keys.len(), "DB batch fetch failed");
+            Err(async_graphql::Error::new(format!(
+                "batch fetch query failed: {}",
+                e
+            )))
+        }
     }
 }
 
@@ -87,7 +99,11 @@ pub(crate) async fn fetch_joined_rows(
     let row = query
         .fetch_optional(pool)
         .await
-        .map_err(|e| async_graphql::Error::new(format!("fetch_joined_rows query failed: {}", e)))?;
+        .map_err(|e| {
+            let msg = e.to_string();
+            tracing::error!(error = %msg, sql_preview = %sql.chars().take(200).collect::<String>(), "DB fetch_joined_rows query failed");
+            async_graphql::Error::new(format!("fetch_joined_rows query failed: {}", e))
+        })?;
     match row {
         Some(row) => {
             let json_str: String = row.try_get(0).map_err(|e| {

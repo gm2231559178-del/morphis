@@ -41,9 +41,7 @@ pub(crate) fn capitalize_first(s: &str) -> String {
 }
 
 pub(crate) fn capitalize_words(s: &str) -> String {
-    s.split('_')
-        .map(|word| capitalize_first(word))
-        .collect()
+    s.split('_').map(capitalize_first).collect()
 }
 
 pub(crate) fn gql_value_to_sql_string(v: &Value) -> String {

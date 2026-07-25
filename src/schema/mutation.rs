@@ -104,11 +104,21 @@ pub(crate) fn build_mutation_object(
 
                         let app_ctx = ctx.data::<std::sync::Arc<AppContext>>()
                             .map_err(|_| async_graphql::Error::new("internal context missing"))?;
-                        let row = db::fetch_one(&app_ctx.pool, &sql, &params)
-                            .await?
-                            .ok_or_else(|| async_graphql::Error::new("no row returned"))?;
-
-                        Ok(Some(FieldValue::value(gql_val(row))))
+                        match db::fetch_one(&app_ctx.pool, &sql, &params).await {
+                            Ok(Some(row)) => {
+                                tracing::info!(table = %table_name, "Created row");
+                                Ok(Some(FieldValue::value(gql_val(row))))
+                            }
+                            Ok(None) => {
+                                tracing::error!(table = %table_name, "Create returned no row");
+                                Err(async_graphql::Error::new("no row returned"))
+                            }
+                            Err(e) => {
+                                let msg = &e.message;
+                                tracing::error!(table = %table_name, error = %msg, "Failed to create row");
+                                Err(e)
+                            }
+                        }
                     })
                 },
             )
@@ -187,11 +197,21 @@ pub(crate) fn build_mutation_object(
                         let app_ctx = ctx
                             .data::<std::sync::Arc<AppContext>>()
                             .map_err(|_| async_graphql::Error::new("internal context missing"))?;
-                        let row = db::fetch_one(&app_ctx.pool, &sql, &params)
-                            .await?
-                            .ok_or_else(|| async_graphql::Error::new("no row returned"))?;
-
-                        Ok(Some(FieldValue::value(gql_val(row))))
+                        match db::fetch_one(&app_ctx.pool, &sql, &params).await {
+                            Ok(Some(row)) => {
+                                tracing::info!(table = %table_name, "Updated row");
+                                Ok(Some(FieldValue::value(gql_val(row))))
+                            }
+                            Ok(None) => {
+                                tracing::error!(table = %table_name, "Update returned no row");
+                                Err(async_graphql::Error::new("no row returned"))
+                            }
+                            Err(e) => {
+                                let msg = &e.message;
+                                tracing::error!(table = %table_name, error = %msg, "Failed to update row");
+                                Err(e)
+                            }
+                        }
                     })
                 },
             );
@@ -259,11 +279,21 @@ pub(crate) fn build_mutation_object(
                         let app_ctx = ctx
                             .data::<std::sync::Arc<AppContext>>()
                             .map_err(|_| async_graphql::Error::new("internal context missing"))?;
-                        let row = db::fetch_one(&app_ctx.pool, &sql, &params)
-                            .await?
-                            .ok_or_else(|| async_graphql::Error::new("no row returned"))?;
-
-                        Ok(Some(FieldValue::value(gql_val(row))))
+                        match db::fetch_one(&app_ctx.pool, &sql, &params).await {
+                            Ok(Some(row)) => {
+                                tracing::info!(table = %table_name, "Deleted row");
+                                Ok(Some(FieldValue::value(gql_val(row))))
+                            }
+                            Ok(None) => {
+                                tracing::error!(table = %table_name, "Delete returned no row");
+                                Err(async_graphql::Error::new("no row returned"))
+                            }
+                            Err(e) => {
+                                let msg = &e.message;
+                                tracing::error!(table = %table_name, error = %msg, "Failed to delete row");
+                                Err(e)
+                            }
+                        }
                     })
                 },
             );

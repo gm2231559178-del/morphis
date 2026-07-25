@@ -80,12 +80,25 @@ impl CircuitBreaker {
                     let n = self.config.half_open_max_requests;
                     if n > 0 {
                         inner.state = State::HalfOpen(n - 1);
+                        tracing::debug!(
+                            failure_count = inner.failure_count,
+                            half_open_max = n,
+                            "Circuit breaker transitioning Open -> HalfOpen"
+                        );
                     } else {
                         inner.state = State::Closed;
                         inner.failure_count = 0;
+                        tracing::debug!(
+                            "Circuit breaker closed directly from Open (half_open_max_requests=0)"
+                        );
                     }
                     true
                 } else {
+                    tracing::trace!(
+                        remaining_secs =
+                            (self.config.reset_timeout - opened_at.elapsed()).as_secs(),
+                        "Circuit breaker rejecting request (open)"
+                    );
                     false
                 }
             }
@@ -94,6 +107,9 @@ impl CircuitBreaker {
                     *remaining -= 1;
                     true
                 } else {
+                    tracing::trace!(
+                        "Circuit breaker rejecting request (half-open slots exhausted)"
+                    );
                     false
                 }
             }
@@ -104,6 +120,10 @@ impl CircuitBreaker {
         let mut inner = self.inner.write().await;
         match inner.state {
             State::HalfOpen(_) | State::Open(_) => {
+                tracing::debug!(
+                    previous_failure_count = inner.failure_count,
+                    "Circuit breaker closed: recovery confirmed"
+                );
                 inner.state = State::Closed;
                 inner.failure_count = 0;
             }
@@ -119,10 +139,22 @@ impl CircuitBreaker {
             State::Closed => {
                 inner.failure_count += 1;
                 if inner.failure_count >= self.config.failure_threshold {
+                    tracing::warn!(
+                        failure_count = inner.failure_count,
+                        threshold = self.config.failure_threshold,
+                        "Circuit breaker opened: failure count reached threshold"
+                    );
                     inner.state = State::Open(Instant::now());
+                } else {
+                    tracing::debug!(
+                        failure_count = inner.failure_count,
+                        threshold = self.config.failure_threshold,
+                        "Circuit breaker recording failure"
+                    );
                 }
             }
             State::HalfOpen(_) => {
+                tracing::warn!("Circuit breaker reopened: half-open probe failed");
                 inner.state = State::Open(Instant::now());
             }
             State::Open(_) => {

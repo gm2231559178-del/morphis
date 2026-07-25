@@ -106,6 +106,7 @@ async fn health() -> &'static str {
     "ok"
 }
 
+#[tracing::instrument(skip_all, fields(method = %req.method(), uri = %req.uri()))]
 async fn auth_middleware(
     mut req: axum::http::Request<axum::body::Body>,
     next: middleware::Next,
@@ -120,23 +121,32 @@ async fn auth_middleware(
         .map(|s| s.trim().to_string());
 
     if let Some(token) = auth_header {
-        let claims = validate_jwt(&token, &auth, jwks_breaker.as_ref()).await;
-        if let Ok(claims) = claims {
-            let headers = req.headers_mut();
-            for mapping in &auth.identity_mappings {
-                if let Some(val) = claims.get(&mapping.claim).and_then(|v| v.as_str())
-                    && let Ok(name) =
-                        axum::http::header::HeaderName::from_bytes(mapping.header.as_bytes())
-                        && let Ok(value) = axum::http::HeaderValue::from_str(val) {
-                            headers.insert(name, value);
-                        }
+        match validate_jwt(&token, &auth, jwks_breaker.as_ref()).await {
+            Ok(claims) => {
+                let headers = req.headers_mut();
+                for mapping in &auth.identity_mappings {
+                    if let Some(val) = claims.get(&mapping.claim).and_then(|v| v.as_str())
+                        && let Ok(name) =
+                            axum::http::header::HeaderName::from_bytes(mapping.header.as_bytes())
+                        && let Ok(value) = axum::http::HeaderValue::from_str(val)
+                    {
+                        headers.insert(name, value);
+                    }
+                }
+                tracing::trace!("Request authenticated successfully");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "JWT validation failed");
             }
         }
+    } else {
+        tracing::debug!("Request without Bearer token");
     }
 
     next.run(req).await
 }
 
+#[tracing::instrument(skip_all)]
 async fn validate_jwt(
     token: &str,
     auth: &AuthConfig,
@@ -144,7 +154,10 @@ async fn validate_jwt(
 ) -> Result<serde_json::Value, String> {
     use jsonwebtoken::decode_header;
 
-    let header = decode_header(token).map_err(|e| format!("JWT header decode failed: {}", e))?;
+    let header = decode_header(token).map_err(|e| {
+        tracing::warn!(error = %e, "JWT header decode failed");
+        format!("JWT header decode failed: {}", e)
+    })?;
 
     if let Some(ref secret) = auth.jwt_secret {
         let mut validation = Validation::new(header.alg);
@@ -161,14 +174,18 @@ async fn validate_jwt(
             &DecodingKey::from_secret(secret.as_bytes()),
             &validation,
         )
-        .map_err(|e| format!("JWT validation failed: {}", e))?;
+        .map_err(|e| {
+            tracing::warn!(error = %e, "JWT HS256 validation failed");
+            format!("JWT validation failed: {}", e)
+        })?;
         return Ok(data.claims);
     }
 
     if let Some(ref jwks_url) = auth.jwks_url {
-        let keys = fetch_jwks_keys(jwks_url, jwks_breaker)
-            .await
-            .map_err(|e| format!("JWKS fetch failed: {}", e))?;
+        let keys = fetch_jwks_keys(jwks_url, jwks_breaker).await.map_err(|e| {
+            tracing::error!(url = %jwks_url, error = %e, "Failed to fetch JWKS keys");
+            format!("JWKS fetch failed: {}", e)
+        })?;
         for key in &keys {
             let mut validation = Validation::new(header.alg);
             if let Some(ref issuer) = auth.issuer {
@@ -183,12 +200,15 @@ async fn validate_jwt(
                 return Ok(data.claims);
             }
         }
+        tracing::warn!(kid = ?header.kid, "No matching JWK key found");
         return Err("No matching JWK key found".to_string());
     }
 
+    tracing::warn!("No jwt_secret or jwks_url configured");
     Err("No jwt_secret or jwks_url configured".into())
 }
 
+#[tracing::instrument(skip_all, fields(url))]
 async fn fetch_jwks_keys(
     url: &str,
     breaker: Option<&CircuitBreaker>,
@@ -206,14 +226,17 @@ async fn fetch_jwks_keys(
         .text()
         .await
         .map_err(|e| format!("JWKS body read failed: {}", e))?;
-    let jwk_set: jsonwebtoken::jwk::JwkSet =
-        serde_json::from_str(&body).map_err(|e| format!("JWKS parse failed: {}", e))?;
+    let jwk_set: jsonwebtoken::jwk::JwkSet = serde_json::from_str(&body).map_err(|e| {
+        tracing::error!(error = %e, "Failed to parse JWKS response");
+        format!("JWKS parse failed: {}", e)
+    })?;
     let mut keys = Vec::new();
     for jwk in &jwk_set.keys {
         if let Ok(key) = DecodingKey::from_jwk(jwk) {
             keys.push(key);
         }
     }
+    tracing::info!(key_count = keys.len(), "Loaded JWKS keys");
     Ok(keys)
 }
 
