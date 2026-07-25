@@ -262,7 +262,7 @@ async fn build_es_row_filters(
 fn collect_searchable_fields(cfg: &SearchIndexConfig) -> Vec<String> {
     let mut fields = cfg.searchable_fields.clone();
     for jf in &cfg.join_fields {
-        tracing::debug!("Collecting searchable fields for join: {}", jf.name);
+        tracing::debug!(join = %jf.name, "Collecting searchable fields for join");
         for f in &jf.searchable_fields {
             fields.push(format!("{}.{}", jf.index_field, f));
         }
@@ -363,7 +363,7 @@ fn es_batch_enrich<'a>(
                 db::fetch_joined_rows_batch(pool, &sql, &keys)
                     .await
                     .unwrap_or_else(|e| {
-                        tracing::warn!("ES batch enrichment query failed: {:?}", e);
+                        tracing::warn!(error = %e.message, "ES batch enrichment query failed");
                         vec![]
                     });
 

@@ -228,7 +228,6 @@ impl MorphisMCPServer {
         &self,
         Parameters(args): Parameters<GraphqlArgs>,
     ) -> Result<CallToolResult, McpError> {
-        tracing::info!(query_preview = %args.query.chars().take(80).collect::<String>(), "MCP graphql query");
         let url = format!("http://localhost:{}/graphql", self.config.server.port);
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -559,7 +558,7 @@ async fn mcp_auth_middleware(
                             Identity::from_raw(headers)
                         }
                         Err(e) => {
-                            tracing::warn!("MCP JWT validation failed: {}", e);
+                            tracing::warn!(error = %e, "MCP JWT validation failed");
                             return Response::builder()
                                 .status(401)
                                 .body(axum::body::Body::from("Unauthorized"))

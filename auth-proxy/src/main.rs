@@ -8,7 +8,7 @@ use pingora::proxy::{ProxyHttp, Session};
 use pingora::server::Server;
 use pingora::upstreams::peer::HttpPeer;
 use serde::Deserialize;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::config::ProxyConfig;
 
@@ -63,6 +63,10 @@ impl ProxyHttp for AuthProxy {
     }
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut ()) -> pingora::Result<bool> {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let span = tracing::info_span!("proxy_request", request_id = %request_id);
+        let _guard = span.enter();
+
         // Skip JWT validation for MCP endpoints — MCP has its own auth
         if session.req_header().uri.path().starts_with("/mcp") {
             return Ok(false);
@@ -136,7 +140,7 @@ impl ProxyHttp for AuthProxy {
                 }
             }
         } else {
-            tracing::error!("No JWT validation keys configured");
+            error!("No JWT validation keys configured");
             session.respond_error(500).await?;
             return Ok(true);
         };
@@ -183,12 +187,17 @@ fn fetch_jwks(url: &str) -> anyhow::Result<Vec<DecodingKey>> {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "auth_proxy=info".into()),
-        )
-        .init();
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "auth_proxy=info".into());
+
+    if std::env::var("LOG_FORMAT").as_deref() == Ok("json") {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .json()
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    }
 
     let config_path =
         std::env::var("AUTH_PROXY_CONFIG").unwrap_or_else(|_| "config.yaml".to_string());

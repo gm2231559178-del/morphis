@@ -17,12 +17,19 @@ use schema::Identity;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "morphis=info".into()),
-        )
-        .init();
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "morphis=info".into());
+
+    if std::env::var("LOG_FORMAT").as_deref() == Ok("json") {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .json()
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .init();
+    }
 
     let config_path = std::env::var("MORPHIS_CONFIG").unwrap_or_else(|_| "config.yaml".to_string());
     let config = Arc::new(config::Config::from_file(&config_path)?);
@@ -106,7 +113,7 @@ async fn health() -> &'static str {
     "ok"
 }
 
-#[tracing::instrument(skip_all, fields(method = %req.method(), uri = %req.uri()))]
+#[tracing::instrument(skip_all, fields(method = %req.method(), uri = %req.uri(), request_id = %uuid::Uuid::new_v4()))]
 async fn auth_middleware(
     mut req: axum::http::Request<axum::body::Body>,
     next: middleware::Next,
@@ -208,7 +215,7 @@ async fn validate_jwt(
     Err("No jwt_secret or jwks_url configured".into())
 }
 
-#[tracing::instrument(skip_all, fields(url))]
+#[tracing::instrument(skip_all, fields(url = %url))]
 async fn fetch_jwks_keys(
     url: &str,
     breaker: Option<&CircuitBreaker>,
