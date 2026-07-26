@@ -153,6 +153,7 @@ async fn es_search(
         es_url.trim_end_matches('/'),
         index_cfg.index
     );
+    tracing::debug!(url = %url, body = %es_query, "ES request body");
     let resp = es_cb
         .call(|| async { es_client.post(&url).json(&es_query).send().await })
         .await
