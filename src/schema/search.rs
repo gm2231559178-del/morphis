@@ -299,15 +299,19 @@ fn build_es_filter_val(val: &ValueAccessor, path_prefix: &str) -> Vec<serde_json
             } else {
                 format!("{}.{}", path_prefix, key)
             };
-            if let Ok(s) = child.string() {
+            if let Ok(child_obj) = child.object() {
+                let child_keys: Vec<String> =
+                    child_obj.iter().map(|(k, _)| k.to_string()).collect();
+                if is_operator_object(&child_keys) {
+                    let field = string_field_path(&full_path);
+                    must.extend(build_es_operator_clauses(&field, &child_obj));
+                } else {
+                    must.extend(build_es_filter_val(&child, &full_path));
+                }
+            } else if let Ok(s) = child.string() {
                 if !s.is_empty() {
-                    let field = if path_prefix.is_empty() {
-                        full_path.clone()
-                    } else {
-                        format!("{}.keyword", full_path)
-                    };
                     must.push(serde_json::json!({
-                        "term": { field: s }
+                        "term": { full_path: s }
                     }));
                 }
             } else if let Ok(n) = child.i64() {
@@ -318,12 +322,138 @@ fn build_es_filter_val(val: &ValueAccessor, path_prefix: &str) -> Vec<serde_json
                 must.push(serde_json::json!({
                     "term": { full_path: n }
                 }));
-            } else {
-                must.extend(build_es_filter_val(&child, &full_path));
             }
         }
     }
     must
+}
+
+const OPERATOR_KEYS: &[&str] = &[
+    "eq", "ne", "in", "all", "contains", "starts_with", "ends_with", "gt", "gte", "lt", "lte",
+];
+
+fn is_operator_object(keys: &[String]) -> bool {
+    keys.iter().any(|k| OPERATOR_KEYS.contains(&k.as_str()))
+}
+
+fn string_field_path(base: &str) -> String {
+    if base.ends_with(".keyword") {
+        base.to_string()
+    } else {
+        format!("{}.keyword", base)
+    }
+}
+
+fn build_es_operator_clauses(
+    field: &str,
+    ops: &async_graphql::dynamic::ObjectAccessor,
+) -> Vec<serde_json::Value> {
+    let mut clauses = Vec::new();
+
+    if let Some(val) = ops.get("eq") {
+        if let Ok(s) = val.string() {
+            clauses.push(serde_json::json!({ "term": { field: s } }));
+        } else if let Ok(n) = val.i64() {
+            clauses.push(serde_json::json!({ "term": { field: n } }));
+        } else if let Ok(n) = val.f64() {
+            clauses.push(serde_json::json!({ "term": { field: n } }));
+        } else if let Ok(b) = val.boolean() {
+            clauses.push(serde_json::json!({ "term": { field: b } }));
+        }
+    }
+
+    if let Some(val) = ops.get("ne") {
+        let mut must_not = Vec::new();
+        if let Ok(s) = val.string() {
+            must_not.push(serde_json::json!({ "term": { field: s } }));
+        } else if let Ok(n) = val.i64() {
+            must_not.push(serde_json::json!({ "term": { field: n } }));
+        } else if let Ok(n) = val.f64() {
+            must_not.push(serde_json::json!({ "term": { field: n } }));
+        } else if let Ok(b) = val.boolean() {
+            must_not.push(serde_json::json!({ "term": { field: b } }));
+        }
+        if !must_not.is_empty() {
+            clauses.push(serde_json::json!({ "bool": { "must_not": must_not } }));
+        }
+    }
+
+    if let Some(val) = ops.get("in")
+        && let Ok(arr) = val.list()
+    {
+        let values: Vec<serde_json::Value> = arr
+            .iter()
+            .filter_map(|v| {
+                if let Ok(s) = v.string() {
+                    Some(serde_json::json!(s))
+                } else if let Ok(n) = v.i64() {
+                    Some(serde_json::json!(n))
+                } else if let Ok(n) = v.f64() {
+                    Some(serde_json::json!(n))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !values.is_empty() {
+            clauses.push(serde_json::json!({ "terms": { field: values } }));
+        }
+    }
+
+    if let Some(val) = ops.get("all")
+        && let Ok(arr) = val.list()
+    {
+        for v in arr.iter() {
+            if let Ok(s) = v.string() {
+                clauses
+                    .push(serde_json::json!({ "term": { field: s } }));
+            } else if let Ok(n) = v.i64() {
+                clauses
+                    .push(serde_json::json!({ "term": { field: n } }));
+            } else if let Ok(n) = v.f64() {
+                clauses
+                    .push(serde_json::json!({ "term": { field: n } }));
+            }
+        }
+    }
+
+    if let Some(val) = ops.get("contains")
+        && let Ok(s) = val.string()
+        && !s.is_empty()
+    {
+        let query_field = if field.ends_with(".keyword") {
+            field.strip_suffix(".keyword").unwrap_or(field)
+        } else {
+            field
+        };
+        clauses.push(serde_json::json!({ "match_phrase": { query_field: s } }));
+    }
+
+    if let Some(val) = ops.get("starts_with")
+        && let Ok(s) = val.string()
+        && !s.is_empty()
+    {
+        clauses.push(serde_json::json!({ "prefix": { field: s } }));
+    }
+
+    if let Some(val) = ops.get("ends_with")
+        && let Ok(s) = val.string()
+        && !s.is_empty()
+    {
+        clauses.push(serde_json::json!({ "wildcard": { field: format!("*{}", s) } }));
+    }
+
+    for op in &["gt", "gte", "lt", "lte"] {
+        if let Some(val) = ops.get(op) {
+            if let Ok(n) = val.i64() {
+                clauses.push(serde_json::json!({ "range": { field: { *op: n } } }));
+            } else if let Ok(n) = val.f64() {
+                clauses.push(serde_json::json!({ "range": { field: { *op: n } } }));
+            }
+        }
+    }
+
+    clauses
 }
 
 fn es_batch_enrich<'a>(

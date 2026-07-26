@@ -14,7 +14,9 @@ use async_graphql::dynamic::{InputObject, InputValue, Schema, TypeRef};
 use sqlx::{Pool, Postgres};
 
 use crate::circuit_breaker::CircuitBreaker;
-use crate::config::{Config, PermissionCache, RowFilterConfig, SearchJoinConfig};
+use crate::config::{
+    ColumnType, Config, PermissionCache, RowFilterConfig, SearchJoinConfig, TableConfig,
+};
 
 #[derive(Clone)]
 pub(crate) struct AppContext {
@@ -85,17 +87,111 @@ pub(crate) fn apply_row_filters(
     }
 }
 
+fn build_string_operators_input() -> InputObject {
+    let mut input = InputObject::new("StringOperatorsInput");
+    input = input.field(InputValue::new("eq", TypeRef::named(TypeRef::STRING)));
+    input = input.field(InputValue::new("ne", TypeRef::named(TypeRef::STRING)));
+    input = input.field(
+        InputValue::new("in", TypeRef::named_nn_list(TypeRef::STRING)),
+    );
+    input = input.field(
+        InputValue::new("all", TypeRef::named_nn_list(TypeRef::STRING)),
+    );
+    input = input.field(InputValue::new("contains", TypeRef::named(TypeRef::STRING)));
+    input = input.field(
+        InputValue::new("starts_with", TypeRef::named(TypeRef::STRING)),
+    );
+    input = input.field(
+        InputValue::new("ends_with", TypeRef::named(TypeRef::STRING)),
+    );
+    input
+}
+
+fn build_int_operators_input() -> InputObject {
+    let mut input = InputObject::new("IntOperatorsInput");
+    input = input.field(InputValue::new("eq", TypeRef::named(TypeRef::INT)));
+    input = input.field(InputValue::new("ne", TypeRef::named(TypeRef::INT)));
+    input = input.field(
+        InputValue::new("in", TypeRef::named_nn_list(TypeRef::INT)),
+    );
+    input = input.field(
+        InputValue::new("all", TypeRef::named_nn_list(TypeRef::INT)),
+    );
+    input = input.field(InputValue::new("gt", TypeRef::named(TypeRef::INT)));
+    input = input.field(InputValue::new("gte", TypeRef::named(TypeRef::INT)));
+    input = input.field(InputValue::new("lt", TypeRef::named(TypeRef::INT)));
+    input = input.field(InputValue::new("lte", TypeRef::named(TypeRef::INT)));
+    input
+}
+
+fn build_float_operators_input() -> InputObject {
+    let mut input = InputObject::new("FloatOperatorsInput");
+    input = input.field(InputValue::new("eq", TypeRef::named(TypeRef::FLOAT)));
+    input = input.field(InputValue::new("ne", TypeRef::named(TypeRef::FLOAT)));
+    input = input.field(
+        InputValue::new("in", TypeRef::named_nn_list(TypeRef::FLOAT)),
+    );
+    input = input.field(
+        InputValue::new("all", TypeRef::named_nn_list(TypeRef::FLOAT)),
+    );
+    input = input.field(InputValue::new("gt", TypeRef::named(TypeRef::FLOAT)));
+    input = input.field(InputValue::new("gte", TypeRef::named(TypeRef::FLOAT)));
+    input = input.field(InputValue::new("lt", TypeRef::named(TypeRef::FLOAT)));
+    input = input.field(InputValue::new("lte", TypeRef::named(TypeRef::FLOAT)));
+    input
+}
+
+fn build_boolean_operators_input() -> InputObject {
+    let mut input = InputObject::new("BooleanOperatorsInput");
+    input = input.field(InputValue::new("eq", TypeRef::named(TypeRef::BOOLEAN)));
+    input = input.field(InputValue::new("ne", TypeRef::named(TypeRef::BOOLEAN)));
+    input
+}
+
+fn operator_type_name(col_type: &ColumnType) -> &'static str {
+    match col_type {
+        ColumnType::Int | ColumnType::Int64 => "IntOperatorsInput",
+        ColumnType::Float => "FloatOperatorsInput",
+        ColumnType::Boolean => "BooleanOperatorsInput",
+        _ => "StringOperatorsInput",
+    }
+}
+
+fn lookup_column_type<'a>(
+    field_name: &str,
+    table_config: &'a TableConfig,
+) -> Option<&'a ColumnType> {
+    table_config
+        .columns
+        .iter()
+        .find(|c| c.name == field_name)
+        .map(|c| &c.col_type)
+}
+
+fn resolve_table_config<'a>(
+    table_name: &str,
+    tables: &'a std::collections::HashMap<String, TableConfig>,
+) -> Option<&'a TableConfig> {
+    tables.values().find(|t| t.table == table_name)
+}
+
 fn build_nested_search_filters(
     join_fields: &[SearchJoinConfig],
     accumulator: &mut Vec<InputObject>,
+    tables: &std::collections::HashMap<String, TableConfig>,
 ) -> Vec<(String, String)> {
     let mut fields = Vec::new();
     for jf in join_fields {
         let type_name = format!("{}Filter", util::capitalize_words(&jf.index_field));
-        let nested = build_nested_search_filters(&jf.join_fields, accumulator);
+        let nested = build_nested_search_filters(&jf.join_fields, accumulator, tables);
         let mut input = InputObject::new(&type_name);
+        let target_table = resolve_table_config(&jf.table, tables);
         for f in &jf.searchable_fields {
-            input = input.field(InputValue::new(f.clone(), TypeRef::named(TypeRef::STRING)));
+            let op_type = target_table
+                .and_then(|tc| lookup_column_type(f, tc))
+                .map(operator_type_name)
+                .unwrap_or("StringOperatorsInput");
+            input = input.field(InputValue::new(f.clone(), TypeRef::named(op_type)));
         }
         for (field_name, nested_type) in nested {
             input = input.field(InputValue::new(field_name, TypeRef::named(nested_type)));
@@ -160,23 +256,33 @@ pub async fn build_schema(config: Arc<Config>, pool: Pool<Postgres>) -> Schema {
     for index_cfg in &config.search_indexes {
         tracing::debug!("Registering search index: {}", index_cfg.name);
 
+        // Register operator input types (idempotent — same types shared across all indexes)
+        schema_builder = schema_builder.register(build_string_operators_input());
+        schema_builder = schema_builder.register(build_int_operators_input());
+        schema_builder = schema_builder.register(build_float_operators_input());
+        schema_builder = schema_builder.register(build_boolean_operators_input());
+
         // Build nested filter input types from join_fields
         let mut nested_filters: Vec<InputObject> = Vec::new();
         let nested_fields =
-            build_nested_search_filters(&index_cfg.join_fields, &mut nested_filters);
+            build_nested_search_filters(&index_cfg.join_fields, &mut nested_filters, &config.tables);
         for input_obj in nested_filters {
             schema_builder = schema_builder.register(input_obj);
         }
 
         // Build top-level search filter input
         let sf = index_cfg.searchable_fields.clone();
+        let source_table = config.tables.get(&index_cfg.graphql_type);
         let mut input_obj = InputObject::new(format!(
             "{}SearchFilter",
             util::capitalize_first(&index_cfg.index)
         ));
         for f in &sf {
-            input_obj =
-                input_obj.field(InputValue::new(f.clone(), TypeRef::named(TypeRef::STRING)));
+            let op_type = source_table
+                .and_then(|tc| lookup_column_type(f, tc))
+                .map(operator_type_name)
+                .unwrap_or("StringOperatorsInput");
+            input_obj = input_obj.field(InputValue::new(f.clone(), TypeRef::named(op_type)));
         }
         for (field_name, type_name) in &nested_fields {
             input_obj = input_obj.field(InputValue::new(
