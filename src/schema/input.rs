@@ -23,7 +23,8 @@ pub(crate) fn build_input_object(
         }
         let nullable = all_nullable || col.nullable;
         let scalar = match col.col_type.to_string().as_str() {
-            "Int" | "Int64" => TypeRef::INT,
+            "Int" => TypeRef::INT,
+            "Int64" => "BigInt",
             "Float" => TypeRef::FLOAT,
             "Boolean" => TypeRef::BOOLEAN,
             _ => TypeRef::STRING,
@@ -42,7 +43,8 @@ pub(crate) fn build_filter_input(name: &str, table_config: &TableConfig) -> Inpu
     let mut input = InputObject::new(format!("{}FilterInput", name));
     for col in &table_config.columns {
         let scalar = match col.col_type.to_string().as_str() {
-            "Int" | "Int64" => TypeRef::INT,
+            "Int" => TypeRef::INT,
+            "Int64" => "BigInt",
             "Float" => TypeRef::FLOAT,
             "Boolean" => TypeRef::BOOLEAN,
             _ => TypeRef::STRING,
@@ -50,6 +52,38 @@ pub(crate) fn build_filter_input(name: &str, table_config: &TableConfig) -> Inpu
         input = input.field(InputValue::new(col.name.clone(), TypeRef::named(scalar)));
     }
     input
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum FilterValue {
+    String(String),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+}
+
+pub(crate) fn build_filter_clauses(
+    pairs: Vec<(String, FilterValue)>,
+    allowed_columns: &[String],
+) -> (String, Vec<String>) {
+    let mut clauses = Vec::new();
+    let mut params = Vec::new();
+
+    for (key, val) in pairs {
+        if !allowed_columns.contains(&key) {
+            continue;
+        }
+        let param = match val {
+            FilterValue::String(s) => s,
+            FilterValue::Int(n) => n.to_string(),
+            FilterValue::Float(f) => f.to_string(),
+            FilterValue::Bool(b) => b.to_string(),
+        };
+        clauses.push(format!("{} = ${}", key, params.len() + 1));
+        params.push(param);
+    }
+
+    (clauses.join(" AND "), params)
 }
 
 pub(crate) fn build_filter_sql(
@@ -61,79 +95,95 @@ pub(crate) fn build_filter_sql(
         Err(_) => return (String::new(), vec![]),
     };
 
-    let mut clauses = Vec::new();
-    let mut params = Vec::new();
-
+    let mut pairs = Vec::new();
     for (key, val) in obj.iter() {
         if val.is_null() {
             continue;
         }
-        if !allowed_columns.contains(&key.to_string()) {
+        let value = if let Ok(s) = val.string() {
+            FilterValue::String(s.to_string())
+        } else if let Ok(n) = val.i64() {
+            FilterValue::Int(n)
+        } else if let Ok(n) = val.f64() {
+            FilterValue::Float(n)
+        } else if let Ok(b) = val.boolean() {
+            FilterValue::Bool(b)
+        } else {
             continue;
-        }
-        if let Ok(s) = val.string() {
-            clauses.push(format!("{} = ${}", key, params.len() + 1));
-            params.push(s.to_string());
-        }
+        };
+        pairs.push((key.to_string(), value));
     }
 
-    (clauses.join(" AND "), params)
+    build_filter_clauses(pairs, allowed_columns)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn allowed(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
-    fn test_filter_clause_generation() {
-        let allowed = ["name".to_string(), "status".to_string()];
-        let pairs = vec![("name", "test"), ("status", "active")];
+    fn test_string_clause() {
+        let pairs = vec![("name".to_string(), FilterValue::String("test".into()))];
+        let (sql, params) = build_filter_clauses(pairs, &allowed(&["name"]));
+        assert_eq!(sql, "name = $1");
+        assert_eq!(params, vec!["test"]);
+    }
 
-        let mut clauses = Vec::new();
-        let mut params = Vec::new();
-        for (key, val) in &pairs {
-            if !allowed.contains(&key.to_string()) {
-                continue;
-            }
-            clauses.push(format!("{} = ${}", key, params.len() + 1));
-            params.push(val.to_string());
-        }
+    #[test]
+    fn test_int_clause() {
+        let pairs = vec![("feature_id".to_string(), FilterValue::Int(3))];
+        let (sql, params) = build_filter_clauses(pairs, &allowed(&["feature_id"]));
+        assert_eq!(sql, "feature_id = $1");
+        assert_eq!(params, vec!["3"]);
+    }
 
-        assert_eq!(clauses.join(" AND "), "name = $1 AND status = $2");
-        assert_eq!(params, vec!["test", "active"]);
+    #[test]
+    fn test_float_clause() {
+        let pairs = vec![("price".to_string(), FilterValue::Float(3.5))];
+        let (sql, params) = build_filter_clauses(pairs, &allowed(&["price"]));
+        assert_eq!(sql, "price = $1");
+        assert_eq!(params, vec!["3.5"]);
+    }
+
+    #[test]
+    fn test_bool_clause() {
+        let pairs = vec![("active".to_string(), FilterValue::Bool(true))];
+        let (sql, params) = build_filter_clauses(pairs, &allowed(&["active"]));
+        assert_eq!(sql, "active = $1");
+        assert_eq!(params, vec!["true"]);
+    }
+
+    #[test]
+    fn test_bind_order_across_types() {
+        let pairs = vec![
+            ("name".to_string(), FilterValue::String("n".into())),
+            ("feature_id".to_string(), FilterValue::Int(7)),
+            ("flag".to_string(), FilterValue::Bool(false)),
+        ];
+        let (sql, params) = build_filter_clauses(pairs, &allowed(&["name", "feature_id", "flag"]));
+        assert_eq!(sql, "name = $1 AND feature_id = $2 AND flag = $3");
+        assert_eq!(params, vec!["n", "7", "false"]);
     }
 
     #[test]
     fn test_unknown_columns_skipped() {
-        let allowed = ["name".to_string()];
-        let pairs = [("name", "test"), ("INJECTION", "evil")];
-
-        let result: Vec<&str> = pairs
-            .iter()
-            .filter(|(k, _)| allowed.contains(&k.to_string()))
-            .map(|(k, _)| *k)
-            .collect();
-
-        assert_eq!(result, vec!["name"]);
+        let pairs = vec![
+            ("name".to_string(), FilterValue::String("n".into())),
+            ("INJECTION".to_string(), FilterValue::String("evil".into())),
+        ];
+        let (sql, params) = build_filter_clauses(pairs, &allowed(&["name"]));
+        assert_eq!(sql, "name = $1");
+        assert_eq!(params, vec!["n"]);
     }
 
     #[test]
     fn test_empty_filter() {
-        let pairs: Vec<(&str, &str)> = vec![];
-        assert!(pairs.is_empty());
-    }
-
-    #[test]
-    fn test_null_values_skipped() {
-        let allowed = ["name".to_string(), "status".to_string()];
-        let pairs = vec![("name", "test")];
-
-        let mut clauses = Vec::new();
-        for (key, _val) in &pairs {
-            if !allowed.contains(&key.to_string()) {
-                continue;
-            }
-            clauses.push(format!("{} = $1", key));
-        }
-
-        assert_eq!(clauses, vec!["name = $1"]);
+        let (sql, params) = build_filter_clauses(vec![], &allowed(&["name"]));
+        assert_eq!(sql, "");
+        assert!(params.is_empty());
     }
 }

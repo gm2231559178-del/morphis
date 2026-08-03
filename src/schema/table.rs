@@ -28,11 +28,17 @@ pub(crate) fn build_table_object(
 ) -> Object {
     let mut obj = Object::new(&table_config.table);
     for col in &table_config.columns {
-        let field_type = match col.col_type.to_string().as_str() {
-            "Int" | "Int64" => TypeRef::named_nn(TypeRef::INT),
-            "Float" => TypeRef::named_nn(TypeRef::FLOAT),
-            "Boolean" => TypeRef::named_nn(TypeRef::BOOLEAN),
-            _ => TypeRef::named_nn(TypeRef::STRING),
+        let scalar = match col.col_type.to_string().as_str() {
+            "Int" => TypeRef::INT,
+            "Int64" => "BigInt",
+            "Float" => TypeRef::FLOAT,
+            "Boolean" => TypeRef::BOOLEAN,
+            _ => TypeRef::STRING,
+        };
+        let field_type = if col.nullable {
+            TypeRef::named(scalar)
+        } else {
+            TypeRef::named_nn(scalar)
         };
         let col_name = col.name.clone();
         obj = obj.field(Field::new(col.name.clone(), field_type, move |ctx| {

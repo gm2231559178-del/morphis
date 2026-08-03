@@ -75,6 +75,9 @@ pub(crate) fn build_mutation_object(
                                 continue;
                             }
                             if let Some(val) = obj.get(&col.name) {
+                                if val.is_null() {
+                                    continue;
+                                }
                                 columns.push(col.name.clone());
                                 params.push(value_as_string(&val));
                             }
@@ -156,8 +159,13 @@ pub(crate) fn build_mutation_object(
 
                         for col in &table_config.columns {
                             if let Some(val) = obj.get(&col.name) {
-                                set_clauses.push(format!("{} = ${}", col.name, params.len() + 1));
-                                params.push(value_as_string(&val));
+                                if val.is_null() {
+                                    set_clauses.push(format!("{} = NULL", col.name));
+                                } else {
+                                    set_clauses
+                                        .push(format!("{} = ${}", col.name, params.len() + 1));
+                                    params.push(value_as_string(&val));
+                                }
                             }
                         }
 

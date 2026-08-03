@@ -80,6 +80,29 @@ HTTP 200
 jsonpath "$.data.feature_attributesList[0].attr_name" == "weave_type"
 jsonpath "$.data.feature_attributesList[0].attr_value" == "plain"
 
+# Numeric filter on int column
+POST http://localhost:4000/graphql
+Content-Type: application/json
+{
+  "query": "{ feature_attributesList(filter: { feature_id: 1 }) { id attr_name } }"
+}
+HTTP 200
+[Asserts]
+jsonpath "$.data.feature_attributesList" count == 2
+jsonpath "$.data.feature_attributesList[0].attr_name" == "weave_type"
+jsonpath "$.data.feature_attributesList[1].attr_name" == "thread_count"
+
+# Numeric filter on auto-increment int PK
+POST http://localhost:4000/graphql
+Content-Type: application/json
+{
+  "query": "{ sizesList(filter: { id: 1 }) { size_code } }"
+}
+HTTP 200
+[Asserts]
+jsonpath "$.data.sizesList" count == 1
+jsonpath "$.data.sizesList[0].size_code" == "S"
+
 # List query with limit
 POST http://localhost:4000/graphql
 Content-Type: application/json
