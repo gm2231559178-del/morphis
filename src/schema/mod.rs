@@ -1,7 +1,4 @@
 pub(crate) mod db;
-mod input;
-mod mutation;
-mod query;
 mod search;
 mod table;
 mod util;
@@ -9,7 +6,7 @@ mod util;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use async_graphql::dynamic::{InputObject, InputValue, Scalar, Schema, TypeRef};
+use async_graphql::dynamic::{InputObject, InputValue, Object, Scalar, Schema, TypeRef};
 use sqlx::{Pool, Postgres};
 
 use crate::circuit_breaker::CircuitBreaker;
@@ -229,35 +226,24 @@ pub async fn build_schema(config: Arc<Config>, pool: Pool<Postgres>) -> Schema {
     schema_builder = schema_builder.data(ctx);
     schema_builder = schema_builder.register(Scalar::new("BigInt"));
 
-    let mut table_type_map: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    for (name, table_config) in &config.tables {
-        table_type_map.insert(table_config.table.clone(), name.clone());
-    }
-
-    let mut table_objects = Vec::new();
+    let mut query = Object::new("Query");
+    let mut mutation = Object::new("Mutation");
     for (name, table_config) in &config.tables {
         if table_config.primary_key.is_empty() {
             panic!("Table '{}' has no primary_key defined", name);
         }
-        let name_caps = util::capitalize_first(name);
-        let filter = input::build_filter_input(&name_caps, table_config);
-        schema_builder = schema_builder.register(filter);
-        let input_obj = input::build_create_input(&name_caps, table_config);
-        schema_builder = schema_builder.register(input_obj);
-        let update_input = input::build_update_input(&name_caps, table_config);
-        schema_builder = schema_builder.register(update_input);
-
-        let obj = table::build_table_object(name, table_config, &config.tables, &table_type_map);
-        schema_builder = schema_builder.register(obj);
-        table_objects.push((
-            name.clone(),
-            table_config.table.clone(),
-            table_config.clone(),
-        ));
+        let surface = table::build_table_surface(&config, name, table_config);
+        for input_obj in surface.inputs {
+            schema_builder = schema_builder.register(input_obj);
+        }
+        schema_builder = schema_builder.register(surface.object);
+        for field in surface.query_fields {
+            query = query.field(field);
+        }
+        for field in surface.mutation_fields {
+            mutation = mutation.field(field);
+        }
     }
-
-    let mut query = query::build_query_object(&config, &table_objects);
 
     for index_cfg in &config.search_indexes {
         tracing::debug!("Registering search index: {}", index_cfg.name);
@@ -305,8 +291,6 @@ pub async fn build_schema(config: Arc<Config>, pool: Pool<Postgres>) -> Schema {
         query = search::add_search_field(query, index_cfg, search_row_filters);
     }
 
-    let mutation = mutation::build_mutation_object(&config, &table_objects);
-
     schema_builder = schema_builder.register(query);
     schema_builder = schema_builder.register(mutation);
 
@@ -342,6 +326,77 @@ mod tests {
         assert!(resp.is_ok(), "introspection returned errors");
         let data = serde_json::to_value(&resp.data).unwrap();
         assert_eq!(data["__schema"]["queryType"]["name"], "Query");
+    }
+
+    #[tokio::test]
+    async fn schema_shape_matches_naming_conventions() {
+        let config = Arc::new(crate::config::Config::from_file("config.yaml").unwrap());
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy(&config.database.url)
+            .unwrap();
+        let schema = build_schema(config.clone(), pool).await;
+
+        let resp = execute(
+            &schema,
+            async_graphql::Request::new(
+                "{ __schema { types { name } queryType { fields { name } } mutationType { fields { name } } } }",
+            ),
+            Identity::default(),
+        )
+        .await;
+
+        assert!(resp.is_ok(), "introspection returned errors");
+        let data = serde_json::to_value(&resp.data).unwrap();
+
+        let types = data["__schema"]["types"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t["name"].as_str())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for expected in [
+            "materials",
+            "sizes",
+            "MaterialsFilterInput",
+            "CreateMaterialsInput",
+            "UpdateMaterialsInput",
+            "CreateSizesInput",
+        ] {
+            assert!(types.contains(&expected), "missing type {expected}");
+        }
+
+        let query_fields = data["__schema"]["queryType"]["fields"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|f| f["name"].as_str())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for expected in ["materials", "materialsList", "sizesList"] {
+            assert!(query_fields.contains(&expected), "missing query {expected}");
+        }
+
+        let mutation_fields = data["__schema"]["mutationType"]["fields"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|f| f["name"].as_str())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for expected in ["createMaterials", "updateMaterials", "deleteMaterials"] {
+            assert!(
+                mutation_fields.contains(&expected),
+                "missing mutation {expected}"
+            );
+        }
+        assert!(
+            !mutation_fields.contains(&"createUser_permissions"),
+            "crud-disabled table must not generate mutations"
+        );
     }
 
     #[test]

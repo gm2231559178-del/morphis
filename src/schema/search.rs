@@ -221,7 +221,8 @@ async fn build_es_row_filters(
                             from_source,
                             user_column,
                         );
-                        let result = db::fetch_joined_rows(&app_ctx.pool, &sql, val).await?;
+                        let result =
+                            db::fetch_rows(&app_ctx.pool, &sql, &[db::Bind::Text(val)]).await?;
                         cache.set(cache_key, result.clone(), ttl);
                         result
                     }
@@ -491,7 +492,7 @@ fn es_batch_enrich<'a>(
                 jf.table, jf.foreign_field
             );
             let mut all_children: Vec<serde_json::Value> =
-                db::fetch_joined_rows_batch(pool, &sql, &keys)
+                db::fetch_rows(pool, &sql, &[db::Bind::Array(&keys)])
                     .await
                     .unwrap_or_else(|e| {
                         tracing::warn!(error = %e.message, "ES batch enrichment query failed");
