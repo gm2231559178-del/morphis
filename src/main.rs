@@ -1,3 +1,4 @@
+mod auth;
 mod circuit_breaker;
 mod config;
 mod db;
@@ -8,10 +9,8 @@ use std::sync::Arc;
 
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::{Router, extract::Extension, middleware, response::Response, routing::get};
-use jsonwebtoken::{DecodingKey, Validation};
 use tower_http::cors::CorsLayer;
 
-use circuit_breaker::CircuitBreaker;
 use config::AuthConfig;
 use schema::Identity;
 
@@ -49,29 +48,34 @@ async fn main() -> anyhow::Result<()> {
         identity_mappings: vec![],
     });
 
-    let jwks_breaker = auth_config
-        .jwks_url
-        .as_ref()
-        .map(|_| CircuitBreaker::new(config.circuit_breakers.jwks.to_circuit_breaker_config()));
-
     let mut app = Router::new()
         .route("/graphql", get(graphql_handler).post(graphql_handler))
         .route("/playground", get(graphql_playground))
         .route("/health", get(health))
         .layer(CorsLayer::permissive())
-        .layer(Extension(schema));
+        .layer(Extension(schema.clone()));
 
     if auth_config.enabled {
         let auth = Arc::new(auth_config);
+        let authenticator = auth::authenticator(
+            auth.jwt_secret.as_deref(),
+            auth.jwks_url.as_deref(),
+            auth.issuer.as_deref(),
+            auth.audience.as_deref(),
+            true,
+            &auth.identity_mappings,
+            auth.jwks_url
+                .as_ref()
+                .map(|_| config.circuit_breakers.jwks.clone()),
+        );
         app = app.layer(middleware::from_fn(move |req, next: middleware::Next| {
-            let auth = auth.clone();
-            let jwks_breaker = jwks_breaker.clone();
-            async move { auth_middleware(req, next, auth, jwks_breaker).await }
+            let authenticator = authenticator.clone();
+            async move { auth_middleware(req, next, authenticator).await }
         }));
     }
 
     // Mount MCP sub-router if enabled
-    if let Some(mcp_router) = mcp::build_mcp_router(config.clone(), pool.clone()) {
+    if let Some(mcp_router) = mcp::build_mcp_router(config.clone(), schema) {
         app = app.merge(mcp_router);
     }
 
@@ -100,9 +104,9 @@ async fn graphql_handler(
             })
             .collect(),
     );
-    let mut request = req.into_inner();
-    request.data.insert(identity);
-    schema.execute(request).await.into()
+    schema::execute(&schema, req.into_inner(), identity)
+        .await
+        .into()
 }
 
 async fn graphql_playground() -> axum::response::Html<&'static str> {
@@ -117,8 +121,7 @@ async fn health() -> &'static str {
 async fn auth_middleware(
     mut req: axum::http::Request<axum::body::Body>,
     next: middleware::Next,
-    auth: Arc<AuthConfig>,
-    jwks_breaker: Option<CircuitBreaker>,
+    authenticator: identity_auth::Authenticator,
 ) -> Response {
     let auth_header = req
         .headers()
@@ -128,14 +131,12 @@ async fn auth_middleware(
         .map(|s| s.trim().to_string());
 
     if let Some(token) = auth_header {
-        match validate_jwt(&token, &auth, jwks_breaker.as_ref()).await {
-            Ok(claims) => {
+        match auth::validate_identity(&authenticator, &token).await {
+            Ok(identity) => {
                 let headers = req.headers_mut();
-                for mapping in &auth.identity_mappings {
-                    if let Some(val) = claims.get(&mapping.claim).and_then(|v| v.as_str())
-                        && let Ok(name) =
-                            axum::http::header::HeaderName::from_bytes(mapping.header.as_bytes())
-                        && let Ok(value) = axum::http::HeaderValue::from_str(val)
+                for (name, value) in identity.into_headers() {
+                    if let Ok(name) = axum::http::header::HeaderName::from_bytes(name.as_bytes())
+                        && let Ok(value) = axum::http::HeaderValue::from_str(&value)
                     {
                         headers.insert(name, value);
                     }
@@ -151,100 +152,6 @@ async fn auth_middleware(
     }
 
     next.run(req).await
-}
-
-#[tracing::instrument(skip_all)]
-async fn validate_jwt(
-    token: &str,
-    auth: &AuthConfig,
-    jwks_breaker: Option<&CircuitBreaker>,
-) -> Result<serde_json::Value, String> {
-    use jsonwebtoken::decode_header;
-
-    let header = decode_header(token).map_err(|e| {
-        tracing::warn!(error = %e, "JWT header decode failed");
-        format!("JWT header decode failed: {}", e)
-    })?;
-
-    if let Some(ref secret) = auth.jwt_secret {
-        let mut validation = Validation::new(header.alg);
-        if let Some(ref issuer) = auth.issuer {
-            validation.set_issuer(&[issuer.as_str()]);
-        }
-        if let Some(ref aud) = auth.audience {
-            validation.set_audience(&[aud.as_str()]);
-        }
-        validation.validate_exp = true;
-
-        let data = jsonwebtoken::decode::<serde_json::Value>(
-            token,
-            &DecodingKey::from_secret(secret.as_bytes()),
-            &validation,
-        )
-        .map_err(|e| {
-            tracing::warn!(error = %e, "JWT HS256 validation failed");
-            format!("JWT validation failed: {}", e)
-        })?;
-        return Ok(data.claims);
-    }
-
-    if let Some(ref jwks_url) = auth.jwks_url {
-        let keys = fetch_jwks_keys(jwks_url, jwks_breaker).await.map_err(|e| {
-            tracing::error!(url = %jwks_url, error = %e, "Failed to fetch JWKS keys");
-            format!("JWKS fetch failed: {}", e)
-        })?;
-        for key in &keys {
-            let mut validation = Validation::new(header.alg);
-            if let Some(ref issuer) = auth.issuer {
-                validation.set_issuer(&[issuer.as_str()]);
-            }
-            if let Some(ref aud) = auth.audience {
-                validation.set_audience(&[aud.as_str()]);
-            }
-            validation.validate_exp = true;
-
-            if let Ok(data) = jsonwebtoken::decode::<serde_json::Value>(token, key, &validation) {
-                return Ok(data.claims);
-            }
-        }
-        tracing::warn!(kid = ?header.kid, "No matching JWK key found");
-        return Err("No matching JWK key found".to_string());
-    }
-
-    tracing::warn!("No jwt_secret or jwks_url configured");
-    Err("No jwt_secret or jwks_url configured".into())
-}
-
-#[tracing::instrument(skip_all, fields(url = %url))]
-async fn fetch_jwks_keys(
-    url: &str,
-    breaker: Option<&CircuitBreaker>,
-) -> Result<Vec<DecodingKey>, String> {
-    let body = match breaker {
-        Some(cb) => cb
-            .call(|| async { reqwest::get(url).await })
-            .await
-            .map_err(|e| e.to_string())?,
-        None => reqwest::get(url)
-            .await
-            .map_err(|e| format!("JWKS fetch failed: {}", e))?,
-    };
-    let body = body
-        .text()
-        .await
-        .map_err(|e| format!("JWKS body read failed: {}", e))?;
-    let jwk_set: jsonwebtoken::jwk::JwkSet = serde_json::from_str(&body).map_err(|e| {
-        tracing::error!(error = %e, "Failed to parse JWKS response");
-        format!("JWKS parse failed: {}", e)
-    })?;
-    let mut keys = Vec::new();
-    for jwk in &jwk_set.keys {
-        if let Ok(key) = DecodingKey::from_jwk(jwk) {
-            keys.push(key);
-        }
-    }
-    tracing::info!(key_count = keys.len(), "Loaded JWKS keys");
-    Ok(keys)
 }
 
 const GRAPHQL_PLAYGROUND_HTML: &str = r#"<!DOCTYPE html>

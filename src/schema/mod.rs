@@ -6,11 +6,10 @@ mod search;
 mod table;
 mod util;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use async_graphql::dynamic::{InputObject, InputValue, Schema, TypeRef};
+use async_graphql::dynamic::{InputObject, InputValue, Scalar, Schema, TypeRef};
 use sqlx::{Pool, Postgres};
 
 use crate::circuit_breaker::CircuitBreaker;
@@ -27,19 +26,25 @@ pub(crate) struct AppContext {
     pub es_circuit_breaker: Option<CircuitBreaker>,
 }
 
-#[derive(Clone, Default)]
-pub(crate) struct Identity {
-    headers: HashMap<String, String>,
-}
+/// Claim-derived request identity consumed by row filters and RBAC.
+///
+/// Re-exported from the shared `identity-auth` crate so the HTTP handler, the MCP tools and
+/// the schema all operate on the same type.
+pub(crate) use identity_auth::Identity;
 
-impl Identity {
-    pub fn from_raw(headers: HashMap<String, String>) -> Self {
-        Self { headers }
-    }
-
-    pub fn header_value(&self, name: &str) -> Option<&str> {
-        self.headers.get(&name.to_lowercase()).map(String::as_str)
-    }
+/// Shared in-process GraphQL execution seam.
+///
+/// Both the HTTP `/graphql` handler and the MCP `graphql` / `graphql_schema` tools cross this
+/// seam, so a query + identity yields the same result regardless of entry point. The `Identity`
+/// travels explicitly from the caller into the request data, where row filters and RBAC read it.
+pub(crate) async fn execute(
+    schema: &Schema,
+    request: async_graphql::Request,
+    identity: Identity,
+) -> async_graphql::Response {
+    let mut request = request;
+    request.data.insert(identity);
+    schema.execute(request).await
 }
 
 pub(crate) fn apply_row_filters(
@@ -222,6 +227,7 @@ pub async fn build_schema(config: Arc<Config>, pool: Pool<Postgres>) -> Schema {
 
     let mut schema_builder = Schema::build("Query", Some("Mutation"), None);
     schema_builder = schema_builder.data(ctx);
+    schema_builder = schema_builder.register(Scalar::new("BigInt"));
 
     let mut table_type_map: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
@@ -305,4 +311,73 @@ pub async fn build_schema(config: Arc<Config>, pool: Pool<Postgres>) -> Schema {
     schema_builder = schema_builder.register(mutation);
 
     schema_builder.finish().unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn identity_with(header: &str, value: &str) -> Identity {
+        let mut headers = HashMap::new();
+        headers.insert(header.to_string(), value.to_string());
+        Identity::from_raw(headers)
+    }
+
+    #[tokio::test]
+    async fn execute_runs_introspection_in_process_without_http() {
+        let config = Arc::new(crate::config::Config::from_file("config.yaml").unwrap());
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy(&config.database.url)
+            .unwrap();
+        let schema = build_schema(config.clone(), pool).await;
+
+        let resp = execute(
+            &schema,
+            async_graphql::Request::new("{ __schema { queryType { name } } }"),
+            Identity::default(),
+        )
+        .await;
+
+        assert!(resp.is_ok(), "introspection returned errors");
+        let data = serde_json::to_value(&resp.data).unwrap();
+        assert_eq!(data["__schema"]["queryType"]["name"], "Query");
+    }
+
+    #[test]
+    fn row_filters_scope_query_by_tenant_identity() {
+        let mut sql = String::from("SELECT * FROM materials");
+        let mut params = Vec::new();
+        let row_filters = vec![RowFilterConfig::ColumnFilter {
+            column: "tenant_id".into(),
+            from_header: "X-Tenant-ID".into(),
+            auto_set: false,
+        }];
+
+        apply_row_filters(
+            &mut sql,
+            &mut params,
+            &identity_with("x-tenant-id", "tenant-a"),
+            &row_filters,
+        );
+        assert!(sql.contains(" WHERE tenant_id = $1"));
+        assert_eq!(params, vec!["tenant-a"]);
+
+        sql = String::from("SELECT * FROM materials");
+        params.clear();
+        apply_row_filters(
+            &mut sql,
+            &mut params,
+            &identity_with("x-tenant-id", "tenant-b"),
+            &row_filters,
+        );
+        assert!(sql.contains("tenant_id = $1"));
+        assert_eq!(params, vec!["tenant-b"]);
+
+        sql = String::from("SELECT * FROM materials");
+        params.clear();
+        apply_row_filters(&mut sql, &mut params, &Identity::default(), &row_filters);
+        assert!(!sql.contains("tenant_id"));
+        assert!(params.is_empty());
+    }
 }
