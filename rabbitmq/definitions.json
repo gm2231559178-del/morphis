@@ -1,0 +1,29 @@
+{
+  "exchanges": [
+    {
+      "name": "pgx",
+      "type": "topic",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false
+    }
+  ],
+  "queues": [
+    {
+      "name": "pgx-events",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false
+    }
+  ],
+  "bindings": [
+    {
+      "source": "pgx",
+      "vhost": "/",
+      "destination": "pgx-events",
+      "destination_type": "queue",
+      "routing_key": "pgx.notify"
+    }
+  ]
+}

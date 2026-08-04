@@ -20,7 +20,7 @@ else
   echo "=== Skipping build ==="
 fi
 
-check_step "Start services" docker compose up -d db es keycloak app auth-proxy
+check_step "Start services" docker compose up -d db es keycloak app auth-proxy rabbitmq pgx-listen-rabbitmq pgx-consume
 
 check_step "Wait for Keycloak" wait_for_http "Keycloak" "http://localhost:8080/realms/master" 200 60
 check_step "Wait for Morphis" bash -c '
@@ -33,6 +33,19 @@ check_step "Wait for Morphis" bash -c '
     sleep 1
   done
   echo "  ERROR: Morphis not ready after 60s (last HTTP $code)" >&2
+  exit 1
+'
+
+check_step "Wait for indexing pipeline" bash -c '
+  for i in $(seq 1 30); do
+    consumers=$(curl -s -u guest:guest http://localhost:15672/api/queues/%2F/pgx-events | python3 -c "import json,sys; print(json.load(sys.stdin).get(\"consumer_count\", 0))" 2>/dev/null || echo 0)
+    if [ "$consumers" -ge 1 ]; then
+      echo "  pipeline consuming ($consumers consumer on pgx-events)"
+      exit 0
+    fi
+    sleep 2
+  done
+  echo "  ERROR: indexing pipeline did not attach a consumer to pgx-events" >&2
   exit 1
 '
 

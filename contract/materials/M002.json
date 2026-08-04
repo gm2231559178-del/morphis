@@ -1,0 +1,42 @@
+{
+  "mat_no": "M002",
+  "name": "Merino Wool Blend",
+  "status": "active",
+  "tenant_id": null,
+  "sizes": [],
+  "colorways": [],
+  "material_features": [
+    {
+      "id": 4,
+      "feature_id": 4,
+      "mat_no": "M002",
+      "feature_name": "Construction",
+      "description": "Knitted",
+      "feature_attributes": [
+        { "id": 7, "feature_id": 4, "attr_name": "weave_type", "attr_value": "knit" },
+        { "id": 8, "feature_id": 4, "attr_name": "weight", "attr_value": "180 gsm" }
+      ]
+    },
+    {
+      "id": 5,
+      "feature_id": 5,
+      "mat_no": "M002",
+      "feature_name": "Certification",
+      "description": null,
+      "feature_attributes": [
+        { "id": 9, "feature_id": 5, "attr_name": "standard", "attr_value": "OEKO-TEX" },
+        { "id": 10, "feature_id": 5, "attr_name": "class", "attr_value": "I" }
+      ]
+    },
+    {
+      "id": 6,
+      "feature_id": 6,
+      "mat_no": "M002",
+      "feature_name": "Water Resistant",
+      "description": "Naturally water-repellent lanolin-rich wool",
+      "feature_attributes": [
+        { "id": 11, "feature_id": 6, "attr_name": "type", "attr_value": "lanolin" }
+      ]
+    }
+  ]
+}

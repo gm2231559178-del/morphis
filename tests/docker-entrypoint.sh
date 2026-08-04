@@ -189,6 +189,31 @@ for f in mcp.hurl; do
   echo ""
 done
 
+echo ""
+echo "=== Child-table write re-indexes parent material (pipeline) ==="
+# A change to a child table (material_features) must fire the child trigger,
+# notify the pipeline, and re-index the parent material document. This is the
+# P6 contract assertion: seeded documents and pipeline documents share one shape.
+PGPASSWORD=postgres psql -h db -U postgres -d morphis -c \
+  "UPDATE material_features SET description = 'PIPELINE-REINDEX-PROBE' WHERE id = 8;" > /dev/null
+FOUND=""
+for i in $(seq 1 45); do
+  FOUND=$(curl -s -X POST http://app:4000/graphql \
+    -H 'Content-Type: application/json' \
+    -d '{"query":"{ searchMaterials(query: \"\", filter: { material_features: { description: { eq: \"PIPELINE-REINDEX-PROBE\" } } }) { mat_no } }"}' \
+    | python3 -c "import json,sys; d=json.load(sys.stdin); r=d.get('data',{}).get('searchMaterials') or []; print(r[0]['mat_no'] if r else '')" 2>/dev/null || true)
+  if [ "$FOUND" = "M003" ]; then
+    echo "  PASS: child write re-indexed parent M003"
+    break
+  fi
+  echo "  waiting for pipeline re-index (attempt $i)..."
+  sleep 2
+done
+if [ "$FOUND" != "M003" ]; then
+  echo "  FAIL: child-table write did not re-index the parent material"
+  FAIL=1
+fi
+
 # Clean up test data and re-seed shared state for downstream consumers (frontend tests, etc.)
 PGPASSWORD=postgres psql -h db -U postgres -d morphis -c "
   TRUNCATE user_permissions, protected_data RESTART IDENTITY CASCADE;

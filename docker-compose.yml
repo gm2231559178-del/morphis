@@ -86,6 +86,11 @@ services:
 
   rabbitmq:
     image: rabbitmq:3-management
+    environment:
+      # Declared, testable pipeline wiring: exchange, queue, and binding are
+      # defined once in rabbitmq/definitions.json and applied at startup.
+      RABBITMQ_LOAD_DEFINITIONS: "true"
+      RABBITMQ_DEFINITIONS_FILE: /etc/rabbitmq/definitions.json
     ports:
       - "5672:5672"
       - "15672:15672"
@@ -94,40 +99,8 @@ services:
       interval: 10s
       timeout: 10s
       retries: 10
-
-  rabbitmq-setup:
-    image: rabbitmq:3-management
-    depends_on:
-      rabbitmq:
-        condition: service_healthy
-    entrypoint: ["sh", "-c", "rabbitmqadmin -H rabbitmq declare exchange name=pgx type=topic durable=true && rabbitmqadmin -H rabbitmq declare queue name=pgx-events durable=true && rabbitmqadmin -H rabbitmq declare binding source=pgx destination=pgx-events routing_key='pgx.notify' && echo 'RabbitMQ exchange and queue ready'"]
-    restart: "no"
-
-  pgx-listen:
-    image: ghcr.io/jyasuu/pg_x:main
-    command:
-      - "listen"
-      - "--channel"
-      - "materials_channel"
-      - "elasticsearch"
-      - "--es-url"
-      - "http://elastic:morphis_es_pass@es:9200"
-      - "--index"
-      - "materials"
-      - "--id-field"
-      - "mat_no"
-    environment:
-      DATABASE_URL: postgres://postgres:postgres@db:5432/morphis
     volumes:
-      - ./pgx/config.toml:/root/.pgx/config.toml
-      - ./pgx/schema:/root/.pgx/schema
-      - ./pgx/queries:/root/.pgx/queries
-    depends_on:
-      db:
-        condition: service_healthy
-      es:
-        condition: service_healthy
-    restart: unless-stopped
+      - ./rabbitmq/definitions.json:/etc/rabbitmq/definitions.json:ro
 
   pgx-listen-rabbitmq:
     image: ghcr.io/jyasuu/pg_x:main
@@ -153,8 +126,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      rabbitmq-setup:
-        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
     restart: unless-stopped
 
   pgx-consume:
@@ -190,8 +163,8 @@ services:
         condition: service_healthy
       es:
         condition: service_healthy
-      rabbitmq-setup:
-        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
     restart: unless-stopped
 
   tests:
@@ -204,6 +177,10 @@ services:
         condition: service_started
       es:
         condition: service_healthy
+      pgx-listen-rabbitmq:
+        condition: service_started
+      pgx-consume:
+        condition: service_started
     profiles:
       - tests
 
@@ -218,7 +195,7 @@ services:
         condition: service_started
       es:
         condition: service_healthy
-      pgx-listen:
+      pgx-consume:
         condition: service_started
     environment:
       DATA_SIZE: "${BENCH_DATA_SIZE:-500}"

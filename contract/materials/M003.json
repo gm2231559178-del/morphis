@@ -1,0 +1,32 @@
+{
+  "mat_no": "M003",
+  "name": "Recycled Polyester",
+  "status": "discontinued",
+  "tenant_id": null,
+  "sizes": [],
+  "colorways": [],
+  "material_features": [
+    {
+      "id": 7,
+      "feature_id": 7,
+      "mat_no": "M003",
+      "feature_name": "Construction",
+      "description": "Twist",
+      "feature_attributes": [
+        { "id": 12, "feature_id": 7, "attr_name": "weave_type", "attr_value": "twist" },
+        { "id": 13, "feature_id": 7, "attr_name": "weight", "attr_value": "150 gsm" }
+      ]
+    },
+    {
+      "id": 8,
+      "feature_id": 8,
+      "mat_no": "M003",
+      "feature_name": "Eco",
+      "description": "Recycled materials",
+      "feature_attributes": [
+        { "id": 14, "feature_id": 8, "attr_name": "recycled_content", "attr_value": "100%" },
+        { "id": 15, "feature_id": 8, "attr_name": "certification", "attr_value": "GRS" }
+      ]
+    }
+  ]
+}

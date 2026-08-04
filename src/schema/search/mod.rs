@@ -2,6 +2,9 @@ mod es_client;
 mod operator;
 mod row_filter;
 
+#[cfg(test)]
+mod contract;
+
 pub(crate) use operator::{build_search_filter_input, nested_filter_inputs, operator_inputs};
 pub(crate) use row_filter::apply_row_filters;
 
@@ -218,6 +221,12 @@ fn collect_searchable_fields(cfg: &SearchIndexConfig) -> Vec<String> {
     fields
 }
 
+/// Compensation layer: re-fetches child rows from Postgres and re-attaches them
+/// to search hits so returned documents stay fresh even when the ES document is
+/// stale. Kept until the P6 document contract is stable and child-table writes
+/// re-index the parent (db/triggers.sql + contract/materials fixtures prove the
+/// pipeline keeps documents current); removable once that is proven by the
+/// integration suite.
 fn es_batch_enrich<'a>(
     pool: &'a Pool<Postgres>,
     sources: &'a mut [serde_json::Value],

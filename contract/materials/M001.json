@@ -1,0 +1,51 @@
+{
+  "mat_no": "M001",
+  "name": "Premium Cotton Canvas",
+  "status": "active",
+  "tenant_id": null,
+  "sizes": [
+    { "id": 1, "size_code": "S", "mat_no": "M001", "name": "Small" },
+    { "id": 2, "size_code": "M", "mat_no": "M001", "name": "Medium" },
+    { "id": 3, "size_code": "L", "mat_no": "M001", "name": "Large" }
+  ],
+  "colorways": [
+    { "id": 1, "colorway_code": "WH", "mat_no": "M001", "name": "White", "hex": "#FFFFFF" },
+    { "id": 2, "colorway_code": "BK", "mat_no": "M001", "name": "Black", "hex": "#000000" },
+    { "id": 3, "colorway_code": "NV", "mat_no": "M001", "name": "Navy", "hex": "#000080" }
+  ],
+  "material_features": [
+    {
+      "id": 1,
+      "feature_id": 1,
+      "mat_no": "M001",
+      "feature_name": "Construction",
+      "description": "Plain weave",
+      "feature_attributes": [
+        { "id": 1, "feature_id": 1, "attr_name": "weave_type", "attr_value": "plain" },
+        { "id": 2, "feature_id": 1, "attr_name": "thread_count", "attr_value": "120" }
+      ]
+    },
+    {
+      "id": 2,
+      "feature_id": 2,
+      "mat_no": "M001",
+      "feature_name": "Care",
+      "description": "Standard care instructions",
+      "feature_attributes": [
+        { "id": 3, "feature_id": 2, "attr_name": "wash", "attr_value": "30°C" },
+        { "id": 4, "feature_id": 2, "attr_name": "bleach", "attr_value": "No" }
+      ]
+    },
+    {
+      "id": 3,
+      "feature_id": 3,
+      "mat_no": "M001",
+      "feature_name": "Water Resistant",
+      "description": "Durable water-repellent finish suitable for outdoor use",
+      "feature_attributes": [
+        { "id": 5, "feature_id": 3, "attr_name": "type", "attr_value": "DWR" },
+        { "id": 6, "feature_id": 3, "attr_name": "durability", "attr_value": "high" }
+      ]
+    }
+  ]
+}

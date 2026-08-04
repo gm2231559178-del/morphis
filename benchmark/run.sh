@@ -22,8 +22,8 @@ done
 echo "  ES is ready"
 
 echo ""
-echo "=== Checking pgx-listen pipeline ==="
-# Verify that pgx-listen is connected and the materials index exists
+echo "=== Checking indexing pipeline ==="
+# Verify that the pgx → RabbitMQ → ES pipeline is connected and the materials index exists
 ES_DOC_COUNT=$(curl -s -u elastic:morphis_es_pass "http://es:9200/materials/_count" | python3 -c "import json,sys; print(json.load(sys.stdin).get('count', 0))" 2>/dev/null || echo "0")
 echo "  Current ES materials index doc count: $ES_DOC_COUNT"
 
