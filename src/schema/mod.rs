@@ -4,23 +4,15 @@ mod table;
 mod util;
 
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
-use async_graphql::dynamic::{InputObject, InputValue, Object, Scalar, Schema, TypeRef};
+use async_graphql::dynamic::{Object, Scalar, Schema};
 use sqlx::{Pool, Postgres};
 
-use crate::circuit_breaker::CircuitBreaker;
-use crate::config::{
-    ColumnType, Config, PermissionCache, RowFilterConfig, SearchJoinConfig, TableConfig,
-};
+use crate::config::Config;
 
 #[derive(Clone)]
 pub(crate) struct AppContext {
     pub pool: Pool<Postgres>,
-    pub es_client: Option<reqwest::Client>,
-    pub es_url: Option<String>,
-    pub permission_cache: Arc<Mutex<PermissionCache>>,
-    pub es_circuit_breaker: Option<CircuitBreaker>,
 }
 
 /// Claim-derived request identity consumed by row filters and RBAC.
@@ -44,183 +36,17 @@ pub(crate) async fn execute(
     schema.execute(request).await
 }
 
-pub(crate) fn apply_row_filters(
-    sql: &mut String,
-    params: &mut Vec<String>,
-    identity: &Identity,
-    row_filters: &[RowFilterConfig],
-) {
-    for rf in row_filters {
-        if let Some(val) = identity.header_value(rf.header_name()) {
-            let clause = match rf {
-                RowFilterConfig::ColumnFilter { column, .. } => {
-                    if params.is_empty() {
-                        format!(" WHERE {} = ${}", column, params.len() + 1)
-                    } else {
-                        format!(" AND {} = ${}", column, params.len() + 1)
-                    }
-                }
-                RowFilterConfig::SubqueryFilter {
-                    columns,
-                    match_columns,
-                    from_source,
-                    user_column,
-                    ..
-                } => {
-                    let prefix = if params.is_empty() {
-                        " WHERE "
-                    } else {
-                        " AND "
-                    };
-                    format!(
-                        "{} ({}) IN (SELECT {} FROM {} WHERE {} = ${})",
-                        prefix,
-                        columns.join(", "),
-                        match_columns.join(", "),
-                        from_source,
-                        user_column,
-                        params.len() + 1,
-                    )
-                }
-            };
-            sql.push_str(&clause);
-            params.push(val.to_string());
-        }
-    }
-}
-
-fn build_string_operators_input() -> InputObject {
-    let mut input = InputObject::new("StringOperatorsInput");
-    input = input.field(InputValue::new("eq", TypeRef::named(TypeRef::STRING)));
-    input = input.field(InputValue::new("ne", TypeRef::named(TypeRef::STRING)));
-    input = input.field(
-        InputValue::new("in", TypeRef::named_nn_list(TypeRef::STRING)),
-    );
-    input = input.field(
-        InputValue::new("all", TypeRef::named_nn_list(TypeRef::STRING)),
-    );
-    input = input.field(InputValue::new("contains", TypeRef::named(TypeRef::STRING)));
-    input = input.field(
-        InputValue::new("starts_with", TypeRef::named(TypeRef::STRING)),
-    );
-    input = input.field(
-        InputValue::new("ends_with", TypeRef::named(TypeRef::STRING)),
-    );
-    input
-}
-
-fn build_int_operators_input() -> InputObject {
-    let mut input = InputObject::new("IntOperatorsInput");
-    input = input.field(InputValue::new("eq", TypeRef::named(TypeRef::INT)));
-    input = input.field(InputValue::new("ne", TypeRef::named(TypeRef::INT)));
-    input = input.field(
-        InputValue::new("in", TypeRef::named_nn_list(TypeRef::INT)),
-    );
-    input = input.field(
-        InputValue::new("all", TypeRef::named_nn_list(TypeRef::INT)),
-    );
-    input = input.field(InputValue::new("gt", TypeRef::named(TypeRef::INT)));
-    input = input.field(InputValue::new("gte", TypeRef::named(TypeRef::INT)));
-    input = input.field(InputValue::new("lt", TypeRef::named(TypeRef::INT)));
-    input = input.field(InputValue::new("lte", TypeRef::named(TypeRef::INT)));
-    input
-}
-
-fn build_float_operators_input() -> InputObject {
-    let mut input = InputObject::new("FloatOperatorsInput");
-    input = input.field(InputValue::new("eq", TypeRef::named(TypeRef::FLOAT)));
-    input = input.field(InputValue::new("ne", TypeRef::named(TypeRef::FLOAT)));
-    input = input.field(
-        InputValue::new("in", TypeRef::named_nn_list(TypeRef::FLOAT)),
-    );
-    input = input.field(
-        InputValue::new("all", TypeRef::named_nn_list(TypeRef::FLOAT)),
-    );
-    input = input.field(InputValue::new("gt", TypeRef::named(TypeRef::FLOAT)));
-    input = input.field(InputValue::new("gte", TypeRef::named(TypeRef::FLOAT)));
-    input = input.field(InputValue::new("lt", TypeRef::named(TypeRef::FLOAT)));
-    input = input.field(InputValue::new("lte", TypeRef::named(TypeRef::FLOAT)));
-    input
-}
-
-fn build_boolean_operators_input() -> InputObject {
-    let mut input = InputObject::new("BooleanOperatorsInput");
-    input = input.field(InputValue::new("eq", TypeRef::named(TypeRef::BOOLEAN)));
-    input = input.field(InputValue::new("ne", TypeRef::named(TypeRef::BOOLEAN)));
-    input
-}
-
-fn operator_type_name(col_type: &ColumnType) -> &'static str {
-    match col_type {
-        ColumnType::Int | ColumnType::Int64 => "IntOperatorsInput",
-        ColumnType::Float => "FloatOperatorsInput",
-        ColumnType::Boolean => "BooleanOperatorsInput",
-        _ => "StringOperatorsInput",
-    }
-}
-
-fn lookup_column_type<'a>(
-    field_name: &str,
-    table_config: &'a TableConfig,
-) -> Option<&'a ColumnType> {
-    table_config
-        .columns
-        .iter()
-        .find(|c| c.name == field_name)
-        .map(|c| &c.col_type)
-}
-
-fn resolve_table_config<'a>(
-    table_name: &str,
-    tables: &'a std::collections::HashMap<String, TableConfig>,
-) -> Option<&'a TableConfig> {
-    tables.values().find(|t| t.table == table_name)
-}
-
-fn build_nested_search_filters(
-    join_fields: &[SearchJoinConfig],
-    accumulator: &mut Vec<InputObject>,
-    tables: &std::collections::HashMap<String, TableConfig>,
-) -> Vec<(String, String)> {
-    let mut fields = Vec::new();
-    for jf in join_fields {
-        let type_name = format!("{}Filter", util::capitalize_words(&jf.index_field));
-        let nested = build_nested_search_filters(&jf.join_fields, accumulator, tables);
-        let mut input = InputObject::new(&type_name);
-        let target_table = resolve_table_config(&jf.table, tables);
-        for f in &jf.searchable_fields {
-            let op_type = target_table
-                .and_then(|tc| lookup_column_type(f, tc))
-                .map(operator_type_name)
-                .unwrap_or("StringOperatorsInput");
-            input = input.field(InputValue::new(f.clone(), TypeRef::named(op_type)));
-        }
-        for (field_name, nested_type) in nested {
-            input = input.field(InputValue::new(field_name, TypeRef::named(nested_type)));
-        }
-        accumulator.push(input);
-        fields.push((jf.index_field.clone(), type_name));
-    }
-    fields
-}
-
 pub async fn build_schema(config: Arc<Config>, pool: Pool<Postgres>) -> Schema {
-    let es_client = config
-        .elasticsearch
-        .as_ref()
-        .map(|_| reqwest::Client::new());
-    let es_url = config.elasticsearch.as_ref().map(|c| c.url.clone());
-    let es_circuit_breaker = config
-        .elasticsearch
-        .as_ref()
-        .map(|_| CircuitBreaker::new(config.circuit_breakers.es.to_circuit_breaker_config()));
-    let ctx = Arc::new(AppContext {
-        pool,
-        es_client,
-        es_url,
-        es_circuit_breaker,
-        permission_cache: Arc::new(Mutex::new(PermissionCache::new())),
-    });
+    let search_service = Arc::new(search::SearchService::new(&config, pool.clone()));
+    build_schema_with_search(config, pool, search_service).await
+}
+
+pub(crate) async fn build_schema_with_search(
+    config: Arc<Config>,
+    pool: Pool<Postgres>,
+    search_service: Arc<search::SearchService>,
+) -> Schema {
+    let ctx = Arc::new(AppContext { pool });
 
     let mut schema_builder = Schema::build("Query", Some("Mutation"), None);
     schema_builder = schema_builder.data(ctx);
@@ -245,50 +71,34 @@ pub async fn build_schema(config: Arc<Config>, pool: Pool<Postgres>) -> Schema {
         }
     }
 
+    // Register operator input types (idempotent — same types shared across all indexes)
+    for input_obj in search::operator_inputs() {
+        schema_builder = schema_builder.register(input_obj);
+    }
+
     for index_cfg in &config.search_indexes {
         tracing::debug!("Registering search index: {}", index_cfg.name);
 
-        // Register operator input types (idempotent — same types shared across all indexes)
-        schema_builder = schema_builder.register(build_string_operators_input());
-        schema_builder = schema_builder.register(build_int_operators_input());
-        schema_builder = schema_builder.register(build_float_operators_input());
-        schema_builder = schema_builder.register(build_boolean_operators_input());
-
         // Build nested filter input types from join_fields
-        let mut nested_filters: Vec<InputObject> = Vec::new();
-        let nested_fields =
-            build_nested_search_filters(&index_cfg.join_fields, &mut nested_filters, &config.tables);
+        let (nested_filters, nested_fields) =
+            search::nested_filter_inputs(index_cfg, &config.tables);
         for input_obj in nested_filters {
             schema_builder = schema_builder.register(input_obj);
         }
 
         // Build top-level search filter input
-        let sf = index_cfg.searchable_fields.clone();
-        let source_table = config.tables.get(&index_cfg.graphql_type);
-        let mut input_obj = InputObject::new(format!(
-            "{}SearchFilter",
-            util::capitalize_first(&index_cfg.index)
+        schema_builder = schema_builder.register(search::build_search_filter_input(
+            index_cfg,
+            &config.tables,
+            &nested_fields,
         ));
-        for f in &sf {
-            let op_type = source_table
-                .and_then(|tc| lookup_column_type(f, tc))
-                .map(operator_type_name)
-                .unwrap_or("StringOperatorsInput");
-            input_obj = input_obj.field(InputValue::new(f.clone(), TypeRef::named(op_type)));
-        }
-        for (field_name, type_name) in &nested_fields {
-            input_obj = input_obj.field(InputValue::new(
-                field_name.clone(),
-                TypeRef::named(type_name.clone()),
-            ));
-        }
-        schema_builder = schema_builder.register(input_obj);
+
         let search_row_filters = config
             .tables
             .get(&index_cfg.graphql_type)
             .map(|t| t.row_filters.clone())
             .unwrap_or_default();
-        query = search::add_search_field(query, index_cfg, search_row_filters);
+        query = search::add_search_field(query, index_cfg, search_row_filters, search_service.clone());
     }
 
     schema_builder = schema_builder.register(query);
@@ -300,13 +110,6 @@ pub async fn build_schema(config: Arc<Config>, pool: Pool<Postgres>) -> Schema {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-
-    fn identity_with(header: &str, value: &str) -> Identity {
-        let mut headers = HashMap::new();
-        headers.insert(header.to_string(), value.to_string());
-        Identity::from_raw(headers)
-    }
 
     #[tokio::test]
     async fn execute_runs_introspection_in_process_without_http() {
@@ -397,42 +200,5 @@ mod tests {
             !mutation_fields.contains(&"createUser_permissions"),
             "crud-disabled table must not generate mutations"
         );
-    }
-
-    #[test]
-    fn row_filters_scope_query_by_tenant_identity() {
-        let mut sql = String::from("SELECT * FROM materials");
-        let mut params = Vec::new();
-        let row_filters = vec![RowFilterConfig::ColumnFilter {
-            column: "tenant_id".into(),
-            from_header: "X-Tenant-ID".into(),
-            auto_set: false,
-        }];
-
-        apply_row_filters(
-            &mut sql,
-            &mut params,
-            &identity_with("x-tenant-id", "tenant-a"),
-            &row_filters,
-        );
-        assert!(sql.contains(" WHERE tenant_id = $1"));
-        assert_eq!(params, vec!["tenant-a"]);
-
-        sql = String::from("SELECT * FROM materials");
-        params.clear();
-        apply_row_filters(
-            &mut sql,
-            &mut params,
-            &identity_with("x-tenant-id", "tenant-b"),
-            &row_filters,
-        );
-        assert!(sql.contains("tenant_id = $1"));
-        assert_eq!(params, vec!["tenant-b"]);
-
-        sql = String::from("SELECT * FROM materials");
-        params.clear();
-        apply_row_filters(&mut sql, &mut params, &Identity::default(), &row_filters);
-        assert!(!sql.contains("tenant_id"));
-        assert!(params.is_empty());
     }
 }

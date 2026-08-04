@@ -11,8 +11,9 @@ use async_graphql::{
 use crate::config::{ColumnType, Config, RelationType, RowFilterConfig, TableConfig};
 
 use super::db;
+use super::search::apply_row_filters;
 use super::util::{capitalize_first, gql_val, gql_value_to_sql_string, value_as_string};
-use super::{AppContext, Identity, apply_row_filters};
+use super::{AppContext, Identity};
 
 /// Everything a single table contributes to the GraphQL schema.
 pub(crate) struct TableSurface {
