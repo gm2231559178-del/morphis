@@ -140,7 +140,13 @@ fn main() -> anyhow::Result<()> {
                 header: m.header.clone(),
             })
             .collect(),
-        jwks_circuit_breaker: None,
+        jwks_circuit_breaker: config.jwks_circuit_breaker.clone().map(|c| {
+            identity_auth::circuit_breaker::CircuitBreakerConfig {
+                failure_threshold: c.failure_threshold,
+                reset_timeout: std::time::Duration::from_secs(c.reset_timeout_secs),
+                half_open_max_requests: c.half_open_max_requests,
+            }
+        }),
     });
 
     // Preserve the historical fail-fast behaviour: an unreachable JWKS endpoint aborts

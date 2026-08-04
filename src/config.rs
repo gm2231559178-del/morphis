@@ -155,9 +155,9 @@ fn default_half_open_max() -> u64 {
 }
 
 impl CircuitBreakerInstanceConfig {
-    pub fn to_circuit_breaker_config(&self) -> crate::circuit_breaker::CircuitBreakerConfig {
+    pub fn to_circuit_breaker_config(&self) -> identity_auth::circuit_breaker::CircuitBreakerConfig {
         use std::time::Duration;
-        crate::circuit_breaker::CircuitBreakerConfig {
+        identity_auth::circuit_breaker::CircuitBreakerConfig {
             failure_threshold: self.failure_threshold,
             reset_timeout: Duration::from_secs(self.reset_timeout_secs),
             half_open_max_requests: self.half_open_max_requests,

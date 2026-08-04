@@ -1,5 +1,4 @@
 mod auth;
-mod circuit_breaker;
 mod config;
 mod db;
 mod mcp;

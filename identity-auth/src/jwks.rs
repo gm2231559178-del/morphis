@@ -128,33 +128,12 @@ fn select_key(keys: &[Jwk], kid: Option<&str>) -> Vec<DecodingKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{
+        kid_only_jwk, spawn_jwks_server, test_jwk, JwksTestServer, TEST_KID,
+    };
 
-    const TEST_RSA_N: &str = "nEoAGI2AatpUzPR_BIUMOmXsHItVwwPzzEZhRW2XszmlivqidBY3XxZA4mRY5kdg_rOC2NC8aWKmqJxHb3emwp1GgjPjvHCtmToqd-LnFjz0Yo5GaBc-MhJHCyBdFXn2IQnC16y2r9pz5ogRm9gRN1tf2DbLljn9x_RjtimkEOitEt-tV__yODxq-i1-yoPUq-f39mRW9AhmoSZozJW_ze1dSBiRMxShKWyVaSR8QmAHIGG_i_riywMxnFVwuCI6Lq2zyRn70vguVx9_A5V9eBIjzIHdGd1BzczqJo0WZ0Vn-Ffp_pX2u2yFaAbOAyPcKDYDiYw5CihfSvhKGFJvLw";
-    const TEST_RSA_E: &str = "AQAB";
-    const TEST_KID: &str = "test-key-1";
-
-    fn test_jwk() -> Jwk {
-        serde_json::from_value(serde_json::json!({
-            "kty": "RSA",
-            "use": "sig",
-            "alg": "RS256",
-            "kid": TEST_KID,
-            "n": TEST_RSA_N,
-            "e": TEST_RSA_E,
-        }))
-        .unwrap()
-    }
-
-    fn kid_only_jwk(kid: &str) -> Jwk {
-        serde_json::from_value(serde_json::json!({
-            "kty": "RSA",
-            "use": "sig",
-            "alg": "RS256",
-            "kid": kid,
-            "n": TEST_RSA_N,
-            "e": TEST_RSA_E,
-        }))
-        .unwrap()
+    fn test_jwks_json() -> String {
+        serde_json::json!({ "keys": [test_jwk()] }).to_string()
     }
 
     #[test]
@@ -182,8 +161,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_keys_fetches_and_caches_from_http_endpoint() {
-        let jwks_json = serde_json::json!({ "keys": [test_jwk()] }).to_string();
-        let server = spawn_jwks_server(jwks_json).await;
+        let server = spawn_jwks_server(test_jwks_json()).await;
         let provider = JwksProvider::new(server.url(), None);
 
         // First resolve triggers a fetch; only the token header matters for key selection.
@@ -199,8 +177,7 @@ mod tests {
 
     #[tokio::test]
     async fn warm_populates_cache_without_a_token() {
-        let jwks_json = serde_json::json!({ "keys": [test_jwk()] }).to_string();
-        let server = spawn_jwks_server(jwks_json).await;
+        let server = spawn_jwks_server(test_jwks_json()).await;
         let provider = JwksProvider::new(server.url(), None);
         provider.warm().await.unwrap();
         // Warmth is observable through a normal resolve, which now hits the cache.
@@ -237,42 +214,5 @@ mod tests {
             }
         }
         out
-    }
-
-    async fn spawn_jwks_server(body: String) -> JwksTestServer {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut socket, _)) = listener.accept().await else {
-                    break;
-                };
-                let body = body.clone();
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    let _ = socket.read(&mut buf).await;
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = socket.write_all(response.as_bytes()).await;
-                });
-            }
-        });
-        JwksTestServer {
-            url: format!("http://{addr}/jwks"),
-        }
-    }
-
-    struct JwksTestServer {
-        url: String,
-    }
-
-    impl JwksTestServer {
-        fn url(&self) -> String {
-            self.url.clone()
-        }
     }
 }

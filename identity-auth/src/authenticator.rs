@@ -37,16 +37,6 @@ impl Authenticator {
         Self { policy, jwks }
     }
 
-    /// Extract the bearer token from an `Authorization` header value (e.g.
-    /// `"Bearer eyJ..."`). Returns the token, or `None` for a missing/empty value.
-    pub fn bearer_token(authorization: Option<&str>) -> Option<String> {
-        authorization
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(str::to_string)
-    }
-
     /// Validate the token and produce the claim-derived identity.
     ///
     /// On failure the returned error message describes the rejection without echoing
@@ -153,39 +143,10 @@ fn stringify_claim(value: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{spawn_jwks_server, JwksTestServer, TEST_KID, TEST_RSA_PRIVATE_KEY};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const TEST_SECRET: &str = "test-secret-that-is-long-enough";
-    const TEST_RSA_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
-MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCcSgAYjYBq2lTM
-9H8EhQw6Zewci1XDA/PMRmFFbZezOaWK+qJ0FjdfFkDiZFjmR2D+s4LY0LxpYqao
-nEdvd6bCnUaCM+O8cK2ZOip34ucWPPRijkZoFz4yEkcLIF0VefYhCcLXrLav2nPm
-iBGb2BE3W1/YNsuWOf3H9GO2KaQQ6K0S361X//I4PGr6LX7Kg9Sr5/f2ZFb0CGah
-JmjMlb/N7V1IGJEzFKEpbJVpJHxCYAcgYb+L+uLLAzGcVXC4IjourbPJGfvS+C5X
-H38DlX14EiPMgd0Z3UHNzOomjRZnRWf4V+n+lfa7bIVoBs4DI9woNgOJjDkKKF9K
-+EoYUm8vAgMBAAECggEAAKwo1/Iz7UHHP6KFsWVJKi8qFu1ajx5DPEvJO10/W9wR
-pElzzYAS+OvFl7PK1iLUfgQTug8b4HA2O1+AxzACna/Dj+fdQQBTHuerKxzk1amp
-e4sVLnl7IQgHGjsna2I89uNt3TO3DYapHQLU4JDLciuIfAuwUJMrTmL00uHW/OOh
-skkYI5p81BA90Qwu/9j7KSwTrF369OA9Vp9eFrAa+TQ6FpZ1SFh71jPT+z//gq8e
-VjbGSjA/hLfm7XUiTXb7uQ1WEy18ad2EL8VfSct6aE+5Om7Sq9gkVcRmpAjyjMmU
-CzQAfNbYVxx3y+s8nHug2sCB/6WAaxYa0iHPwybLwQKBgQDLMJJz/eEpf9aJL2sv
-yIAyduS/pDelkjnc9FoVNTbGvl5TJ4D/jUxb/Q+KqqlvOGYGOFirx2vw78gpUGAj
-i+OK2r6SwBnfoQCQvXTE1KvGNX6vYVMW/xHp3/N71bcmhln0xh01t/CrZ07Xm5Ve
-IUGj4WX/kHUvN6i/vFQMaxv5UQKBgQDE6Nij1tPzy2X9q+TDLZs6lB2vv2zaXRb3
-pOUZcRE1mkU+Ck8QApcVWD4CgMTM36WPISA5BW6HrI0OUyor8ss5SBQ7zXvxNal/
-YcihhV27FREmNKsMTrVkuIdbw5es8STLc4yv4ZPiEDR1KeqZ5UwgVBnGGjl52xoI
-pauZZeXAfwKBgF94VgfMDSSbnWjd7+YGtj1/4aEt/rt8BlYMNdtrIm6ledpmYFUy
-xeMe91N3Np88h6t6hCdKTyxo7cqDqnhpPSO7/fkj68RIeOSJMDlfl8pMzlaHSywt
-8vPJtzTDSQf/7np1L7pSz/EpXEEwKDGPPLFMsckvze++njpgubkQBpfRAoGAEHJq
-dfThq0FX+YI8D1ll19S7TgytKOgRnQm24RMintmN4wq1Y97zg6LlOwxKY9piV7wq
-ltivTMHK3mFv6k/TTauJlR0qtxEGYU9nlKYxGAlAb3KCvvpsCEepdq61oopZymyS
-WbZ7xawY1Zh0sfoHC8Q6iuNx3Y3BdOtxk9SBBj0CgYEAmMtUzN8Oz07KHaQL9A44
-6eqk+J7YBAzA5Q89aAECNMi61VG9wDdcwD8eIqpbTyXJFLuiFnGTl2F947oyIU8W
-x5DLdAwGT5DZzacCjprQ3LcAOcJRKEVVLpFZWYJw2Zf6ScVUVM6T3e9B/H5cqbbs
-nk5Oc8VQZdFJV3nIb0Zbms0=
------END PRIVATE KEY-----"#;
-
-    const TEST_KID: &str = "test-key-1";
 
     fn secret_policy(require_exp: bool) -> AuthPolicy {
         AuthPolicy {
@@ -329,9 +290,6 @@ nk5Oc8VQZdFJV3nIb0Zbms0=
         let token = sign_hs256(serde_json::json!({ "sub": "u", "tenant_id": "t" }));
         let authenticator = Authenticator::new(secret_policy(false));
         let identity = authenticator.authenticate(&token).await;
-        if let Err(ref e) = identity {
-            eprintln!("DEBUG ERROR: {:?}", e);
-        }
         assert!(identity.is_ok());
     }
 
@@ -396,62 +354,12 @@ nk5Oc8VQZdFJV3nIb0Zbms0=
     #[tokio::test]
     async fn expired_rs256_token_rejected_when_jwks_exp_enforced() {
         let token = sign_rs256(serde_json::json!({ "sub": "u", "exp": now() - 3600 }));
-        let server = spawn_jwks_server(TEST_JWKS_JSON.to_string()).await;
+        let server = spawn_jwks_server(crate::test_support::test_jwks_json()).await;
         let policy = AuthPolicy {
             jwks_url: Some(server.url()),
             ..jwks_policy(true)
         };
         let result = Authenticator::new(policy).authenticate(&token).await;
         assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn bearer_token_extraction() {
-        assert_eq!(
-            Authenticator::bearer_token(Some("Bearer eyJhbGciOiJIUzI1NiJ9.abc.def")),
-            Some("eyJhbGciOiJIUzI1NiJ9.abc.def".to_string())
-        );
-        assert_eq!(Authenticator::bearer_token(Some("Basic abc")), None);
-        assert_eq!(Authenticator::bearer_token(Some("Bearer ")), None);
-        assert_eq!(Authenticator::bearer_token(None), None);
-    }
-
-    const TEST_JWKS_JSON: &str = r#"{"keys":[{"kty":"RSA","use":"sig","alg":"RS256","kid":"test-key-1","n":"nEoAGI2AatpUzPR_BIUMOmXsHItVwwPzzEZhRW2XszmlivqidBY3XxZA4mRY5kdg_rOC2NC8aWKmqJxHb3emwp1GgjPjvHCtmToqd-LnFjz0Yo5GaBc-MhJHCyBdFXn2IQnC16y2r9pz5ogRm9gRN1tf2DbLljn9x_RjtimkEOitEt-tV__yODxq-i1-yoPUq-f39mRW9AhmoSZozJW_ze1dSBiRMxShKWyVaSR8QmAHIGG_i_riywMxnFVwuCI6Lq2zyRn70vguVx9_A5V9eBIjzIHdGd1BzczqJo0WZ0Vn-Ffp_pX2u2yFaAbOAyPcKDYDiYw5CihfSvhKGFJvLw","e":"AQAB"}]}"#;
-
-    async fn spawn_jwks_server(body: String) -> JwksTestServer {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut socket, _)) = listener.accept().await else {
-                    break;
-                };
-                let body = body.clone();
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 1024];
-                    let _ = socket.read(&mut buf).await;
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = socket.write_all(response.as_bytes()).await;
-                });
-            }
-        });
-        JwksTestServer {
-            url: format!("http://{addr}/jwks"),
-        }
-    }
-
-    struct JwksTestServer {
-        url: String,
-    }
-
-    impl JwksTestServer {
-        fn url(&self) -> String {
-            self.url.clone()
-        }
     }
 }

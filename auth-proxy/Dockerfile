@@ -4,12 +4,15 @@ WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
 COPY auth-proxy/Cargo.toml auth-proxy/Cargo.toml
-RUN mkdir -p src auth-proxy/src && \
+COPY identity-auth/Cargo.toml identity-auth/Cargo.toml
+RUN mkdir -p src auth-proxy/src identity-auth/src && \
     echo 'fn main() {}' > src/main.rs && \
     echo 'fn main() {}' > auth-proxy/src/main.rs && \
+    echo '' > identity-auth/src/lib.rs && \
     cargo build --release -p auth-proxy
 
 COPY auth-proxy/src/ auth-proxy/src/
+COPY identity-auth/src/ identity-auth/src/
 RUN touch auth-proxy/src/main.rs && cargo build --release -p auth-proxy
 
 FROM alpine:3.20

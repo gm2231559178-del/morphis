@@ -157,9 +157,9 @@ impl CircuitBreaker {
                 tracing::warn!("Circuit breaker reopened: half-open probe failed");
                 inner.state = State::Open(Instant::now());
             }
-            State::Open(_) => {
-                inner.state = State::Open(Instant::now());
-            }
+            // Unreachable: call() gates on is_request_allowed(), which rejects
+            // while Open, so failures are only recorded in Closed/HalfOpen.
+            State::Open(_) => {}
         }
     }
 }

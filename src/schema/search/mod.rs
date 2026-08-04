@@ -14,7 +14,8 @@ use tokio::sync::Mutex;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, Object, TypeRef, ValueAccessor};
 use sqlx::{Pool, Postgres};
 
-use crate::circuit_breaker::CircuitBreaker;
+use identity_auth::circuit_breaker::CircuitBreaker;
+
 use crate::config::{Config, RowFilterConfig, SearchIndexConfig, SearchJoinConfig};
 
 use super::db;
@@ -221,6 +222,18 @@ fn collect_searchable_fields(cfg: &SearchIndexConfig) -> Vec<String> {
     fields
 }
 
+/// Normalise a JSON scalar to its string key form. FK columns come back from
+/// `json_agg(row_to_json(t))` as JSON numbers when the column is `int`, so key
+/// extraction must not rely on `as_str()` (which returns `None` for numbers and
+/// would wipe nested children to `[]`).
+fn key_value(v: &serde_json::Value) -> Option<String> {
+    if let Some(s) = v.as_str() {
+        Some(s.to_string())
+    } else {
+        v.as_i64().map(|n| n.to_string())
+    }
+}
+
 /// Compensation layer: re-fetches child rows from Postgres and re-attaches them
 /// to search hits so returned documents stay fresh even when the ES document is
 /// stale. Kept until the P6 document contract is stable and child-table writes
@@ -242,9 +255,8 @@ fn es_batch_enrich<'a>(
                 .iter()
                 .filter_map(|s| {
                     s.get(&jf.local_field)
-                        .and_then(|v| v.as_str())
+                        .and_then(key_value)
                         .filter(|v| !v.is_empty())
-                        .map(String::from)
                 })
                 .collect();
 
@@ -258,7 +270,7 @@ fn es_batch_enrich<'a>(
             }
 
             let sql = format!(
-                "SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json)::text FROM (SELECT * FROM {} WHERE {} = ANY($1)) t",
+                "SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json)::text FROM (SELECT * FROM {} WHERE {}::text = ANY($1)) t",
                 jf.table, jf.foreign_field
             );
             let mut all_children: Vec<serde_json::Value> =
@@ -273,19 +285,16 @@ fn es_batch_enrich<'a>(
                 es_batch_enrich(pool, &mut all_children, &jf.join_fields).await?;
             }
 
-            let mut grouped: HashMap<&str, Vec<serde_json::Value>> = HashMap::new();
+            let mut grouped: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
             for child in &all_children {
-                if let Some(v) = child.get(&jf.foreign_field).and_then(|v| v.as_str()) {
+                if let Some(v) = child.get(&jf.foreign_field).and_then(key_value) {
                     grouped.entry(v).or_default().push(child.clone());
                 }
             }
 
             for source in sources.iter_mut() {
-                let key = source
-                    .get(&jf.local_field)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let children = grouped.remove(key).unwrap_or_default();
+                let key = source.get(&jf.local_field).and_then(key_value).unwrap_or_default();
+                let children = grouped.remove(&key).unwrap_or_default();
                 if let Some(obj) = source.as_object_mut() {
                     obj.insert(jf.index_field.clone(), serde_json::Value::Array(children));
                 }
@@ -319,6 +328,14 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn key_value_normalises_strings_and_numbers() {
+        assert_eq!(key_value(&serde_json::json!("M001")), Some("M001".to_string()));
+        assert_eq!(key_value(&serde_json::json!(7)), Some("7".to_string()));
+        assert_eq!(key_value(&serde_json::json!(-3)), Some("-3".to_string()));
+        assert_eq!(key_value(&serde_json::Value::Null), None);
     }
 
     async fn run(schema: &Schema, query: &str) -> async_graphql::Response {

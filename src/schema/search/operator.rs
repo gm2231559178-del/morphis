@@ -68,7 +68,8 @@ fn is_operator_object(keys: &[String]) -> bool {
 /// The operator input type name for a column type.
 fn operator_type_name(col_type: &ColumnType) -> &'static str {
     match col_type {
-        ColumnType::Int | ColumnType::Int64 => "IntOperatorsInput",
+        ColumnType::Int => "IntOperatorsInput",
+        ColumnType::Int64 => "BigIntOperatorsInput",
         ColumnType::Float => "FloatOperatorsInput",
         ColumnType::Boolean => "BooleanOperatorsInput",
         _ => "StringOperatorsInput",
@@ -100,6 +101,7 @@ pub(crate) fn operator_inputs() -> Vec<InputObject> {
             STRING_OPERATORS,
         ),
         build_operator_input("IntOperatorsInput", TypeRef::INT, NUMERIC_OPERATORS),
+        build_operator_input("BigIntOperatorsInput", "BigInt", NUMERIC_OPERATORS),
         build_operator_input(
             "FloatOperatorsInput",
             TypeRef::FLOAT,

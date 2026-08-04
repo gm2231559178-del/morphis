@@ -214,6 +214,29 @@ if [ "$FOUND" != "M003" ]; then
   FAIL=1
 fi
 
+echo "=== Nested child-table write re-indexes parent (feature_attributes) ==="
+# The deepest level: feature_attributes rows are grouped by the numeric
+# feature id, which regressed once (keys became empty, wiping children to []).
+PGPASSWORD=postgres psql -h db -U postgres -d morphis -c \
+  "UPDATE feature_attributes SET attr_value = 'PIPELINE-ATTR-PROBE' WHERE feature_id = 8;" > /dev/null
+FOUND=""
+for i in $(seq 1 45); do
+  FOUND=$(curl -s -X POST http://app:4000/graphql \
+    -H 'Content-Type: application/json' \
+    -d '{"query":"{ searchMaterials(query: \"\", filter: { material_features: { feature_attributes: { attr_value: { eq: \"PIPELINE-ATTR-PROBE\" } } } }) { mat_no } }"}' \
+    | python3 -c "import json,sys; d=json.load(sys.stdin); r=d.get('data',{}).get('searchMaterials') or []; print(r[0]['mat_no'] if r else '')" 2>/dev/null || true)
+  if [ "$FOUND" = "M003" ]; then
+    echo "  PASS: nested child write re-indexed parent M003"
+    break
+  fi
+  echo "  waiting for nested pipeline re-index (attempt $i)..."
+  sleep 2
+done
+if [ "$FOUND" != "M003" ]; then
+  echo "  FAIL: nested child-table write did not re-index the parent material"
+  FAIL=1
+fi
+
 # Clean up test data and re-seed shared state for downstream consumers (frontend tests, etc.)
 PGPASSWORD=postgres psql -h db -U postgres -d morphis -c "
   TRUNCATE user_permissions, protected_data RESTART IDENTITY CASCADE;

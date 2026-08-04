@@ -12,6 +12,9 @@ pub mod policy;
 
 mod identity;
 
+#[cfg(test)]
+mod test_support;
+
 pub use authenticator::{AuthError, Authenticator};
 pub use identity::{Identity, IdentityMapping};
 pub use policy::AuthPolicy;

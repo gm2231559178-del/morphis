@@ -36,10 +36,6 @@ impl Identity {
     pub fn into_headers(self) -> HashMap<String, String> {
         self.headers
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.headers.is_empty()
-    }
 }
 
 #[cfg(test)]
@@ -57,9 +53,8 @@ mod tests {
     }
 
     #[test]
-    fn empty_identity_is_anonymous() {
+    fn empty_identity_has_no_headers() {
         let identity = Identity::default();
-        assert!(identity.is_empty());
         assert_eq!(identity.header_value("x-tenant-id"), None);
     }
 }

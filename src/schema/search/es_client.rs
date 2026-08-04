@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::circuit_breaker::CircuitBreaker;
+use identity_auth::circuit_breaker::CircuitBreaker;
 
 /// Error raised by an ES client adapter.
 #[derive(Debug)]

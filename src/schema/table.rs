@@ -3,12 +3,12 @@ use std::collections::HashMap;
 use async_graphql::{
     Name, Value,
     dynamic::{
-        Field, FieldFuture, FieldValue, InputObject, InputValue, Object, ResolverContext, TypeRef,
-        ValueAccessor,
+        Field, FieldFuture, FieldValue, InputObject, InputValue, Object, ObjectAccessor,
+        ResolverContext, TypeRef, ValueAccessor,
     },
 };
 
-use crate::config::{ColumnType, Config, RelationType, RowFilterConfig, TableConfig};
+use crate::config::{ColumnConfig, ColumnType, Config, RelationType, RowFilterConfig, TableConfig};
 
 use super::db;
 use super::search::apply_row_filters;
@@ -459,6 +459,51 @@ fn build_list_query_field(name: &str, table_config: &TableConfig) -> Field {
 
 // ── Mutation fields ───────────────────────────────────────────
 
+/// Column names and SQL parameters for a create. Null inputs are skipped so the
+/// column's default applies; auto-set columns are excluded because their values
+/// come from the request identity, not the input.
+fn create_column_binds(
+    columns: &[ColumnConfig],
+    input: &ObjectAccessor,
+    auto_set_columns: &[&str],
+) -> (Vec<String>, Vec<String>) {
+    let mut out_columns = Vec::new();
+    let mut params = Vec::new();
+    for col in columns {
+        if auto_set_columns.contains(&col.name.as_str()) {
+            continue;
+        }
+        if let Some(val) = input.get(&col.name) {
+            if val.is_null() {
+                continue;
+            }
+            out_columns.push(col.name.clone());
+            params.push(value_as_string(&val));
+        }
+    }
+    (out_columns, params)
+}
+
+/// For each column present in the update input: `(column, param)` where `None`
+/// means an explicit `col = NULL` (no bound parameter) and `Some(v)` is the
+/// bound value. Columns absent from the input are left untouched.
+fn update_column_binds(
+    columns: &[ColumnConfig],
+    input: &ObjectAccessor,
+) -> Vec<(String, Option<String>)> {
+    columns
+        .iter()
+        .filter_map(|col| {
+            let val = input.get(&col.name)?;
+            if val.is_null() {
+                Some((col.name.clone(), None))
+            } else {
+                Some((col.name.clone(), Some(value_as_string(&val))))
+            }
+        })
+        .collect()
+}
+
 fn build_create_field(name_caps: &str, table_config: &TableConfig) -> Field {
     let table_config = table_config.clone();
     let table_name = table_config.table.clone();
@@ -490,19 +535,10 @@ fn build_create_field(name_caps: &str, table_config: &TableConfig) -> Field {
 
                 let mut columns = Vec::new();
                 let mut params = Vec::new();
-
-                for col in &table_config.columns {
-                    if auto_set_columns.contains(&col.name.as_str()) {
-                        continue;
-                    }
-                    if let Some(val) = obj.get(&col.name) {
-                        if val.is_null() {
-                            continue;
-                        }
-                        columns.push(col.name.clone());
-                        params.push(value_as_string(&val));
-                    }
-                }
+                let (new_columns, new_params) =
+                    create_column_binds(&table_config.columns, &obj, &auto_set_columns);
+                columns.extend(new_columns);
+                params.extend(new_params);
 
                 if let Ok(identity) = ctx.data::<Identity>() {
                     for rf in &row_filters {
@@ -583,14 +619,12 @@ fn build_update_field(
                 let mut set_clauses = Vec::new();
                 let mut params = Vec::new();
 
-                for col in &table_config.columns {
-                    if let Some(val) = obj.get(&col.name) {
-                        if val.is_null() {
-                            set_clauses.push(format!("{} = NULL", col.name));
-                        } else {
-                            set_clauses
-                                .push(format!("{} = ${}", col.name, params.len() + 1));
-                            params.push(value_as_string(&val));
+                for (column, param) in update_column_binds(&table_config.columns, &obj) {
+                    match param {
+                        None => set_clauses.push(format!("{column} = NULL")),
+                        Some(v) => {
+                            set_clauses.push(format!("{column} = ${}", params.len() + 1));
+                            params.push(v);
                         }
                     }
                 }

@@ -29,10 +29,3 @@ pub struct AuthPolicy {
     /// Circuit breaker config for JWKS fetches. `None` uses a default.
     pub jwks_circuit_breaker: Option<CircuitBreakerConfig>,
 }
-
-impl AuthPolicy {
-    /// Whether any key source is configured. Entry points use this to fail fast at startup.
-    pub fn has_key_source(&self) -> bool {
-        self.jwt_secret.is_some() || self.jwks_url.is_some()
-    }
-}
