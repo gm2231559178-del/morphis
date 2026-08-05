@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Seeds the materials index from the contract fixtures (contract/materials/*.json).
+# Every document is the canonical shape produced by the indexing pipeline, so the
+# seeded data never drifts from what pgx emits. The contract is validated by the
+# fixture test in src/schema/search/contract.rs.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONTRACT_DIR="${CONTRACT_DIR:-$SCRIPT_DIR/contract/materials}"
+
 ES_URL="${ES_URL:-http://localhost:9200}"
 ES_AUTH="${ES_AUTH:--u elastic:morphis_es_pass}"
 INDEX="${1:-materials}"
@@ -11,82 +19,16 @@ curl -s $ES_AUTH -X PUT "$ES_URL/$INDEX" -H "Content-Type: application/json" -d 
 }' | python3 -m json.tool
 
 echo ""
-echo "=== Indexing documents ==="
+echo "=== Indexing documents from $CONTRACT_DIR ==="
 
-# Material M001 - Premium Cotton Canvas
-curl -s $ES_AUTH -X POST "$ES_URL/$INDEX/_doc/M001" -H "Content-Type: application/json" -d '{
-  "mat_no": "M001",
-  "name": "Premium Cotton Canvas",
-  "status": "active",
-  "material_features": [
-    {
-      "feature_name": "Construction",
-      "description": "Plain weave",
-      "feature_attributes": [
-        { "attr_name": "weave_type", "attr_value": "plain" },
-        { "attr_name": "thread_count", "attr_value": "120" }
-      ]
-    },
-    {
-      "feature_name": "Care",
-      "description": "Standard care instructions",
-      "feature_attributes": [
-        { "attr_name": "wash", "attr_value": "30°C" },
-        { "attr_name": "bleach", "attr_value": "No" }
-      ]
-    }
-  ]
-}' | python3 -m json.tool
-
-# Material M002 - Merino Wool Blend
-curl -s $ES_AUTH -X POST "$ES_URL/$INDEX/_doc/M002" -H "Content-Type: application/json" -d '{
-  "mat_no": "M002",
-  "name": "Merino Wool Blend",
-  "status": "active",
-  "material_features": [
-    {
-      "feature_name": "Construction",
-      "description": "Knitted",
-      "feature_attributes": [
-        { "attr_name": "weave_type", "attr_value": "knit" },
-        { "attr_name": "weight", "attr_value": "180 gsm" }
-      ]
-    },
-    {
-      "feature_name": "Certification",
-      "description": null,
-      "feature_attributes": [
-        { "attr_name": "standard", "attr_value": "OEKO-TEX" },
-        { "attr_name": "class", "attr_value": "I" }
-      ]
-    }
-  ]
-}' | python3 -m json.tool
-
-# Material M003 - Recycled Polyester
-curl -s $ES_AUTH -X POST "$ES_URL/$INDEX/_doc/M003" -H "Content-Type: application/json" -d '{
-  "mat_no": "M003",
-  "name": "Recycled Polyester",
-  "status": "discontinued",
-  "material_features": [
-    {
-      "feature_name": "Construction",
-      "description": "Twist",
-      "feature_attributes": [
-        { "attr_name": "weave_type", "attr_value": "twist" },
-        { "attr_name": "weight", "attr_value": "150 gsm" }
-      ]
-    },
-    {
-      "feature_name": "Eco",
-      "description": "Recycled materials",
-      "feature_attributes": [
-        { "attr_name": "recycled_content", "attr_value": "100%" },
-        { "attr_name": "certification", "attr_value": "GRS" }
-      ]
-    }
-  ]
-}' | python3 -m json.tool
+for fixture in "$CONTRACT_DIR"/*.json; do
+  [ -e "$fixture" ] || { echo "  ERROR: no fixtures found in $CONTRACT_DIR"; exit 1; }
+  mat_no="$(basename "$fixture" .json)"
+  echo "  indexing $mat_no"
+  curl -s $ES_AUTH -X POST "$ES_URL/$INDEX/_doc/$mat_no" \
+    -H "Content-Type: application/json" \
+    --data-binary "@$fixture" | python3 -m json.tool
+done
 
 echo ""
 echo "=== Refreshing index ==="

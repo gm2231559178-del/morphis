@@ -64,6 +64,49 @@ HTTP 200
 [Asserts]
 jsonpath "$.data.updateSizes.name" == "Small"
 
+# Create colorway with explicit null for a nullable column
+POST http://localhost:4000/graphql
+Content-Type: application/json
+{
+  "query": "mutation { createColorways(input: { colorway_code: \"NT\", mat_no: \"M001\", name: \"Null Test\", hex: null }) { id colorway_code hex } }"
+}
+HTTP 200
+[Captures]
+colorway_id: jsonpath "$.data.createColorways.id"
+[Asserts]
+jsonpath "$.data.createColorways.colorway_code" == "NT"
+jsonpath "$.data.createColorways.hex" == null
+
+# Update created colorway: set a value on the nullable column
+POST http://localhost:4000/graphql
+Content-Type: application/json
+{
+  "query": "mutation { updateColorways(id: {{colorway_id}}, input: { hex: \"#ABCDEF\" }) { hex } }"
+}
+HTTP 200
+[Asserts]
+jsonpath "$.data.updateColorways.hex" == "#ABCDEF"
+
+# Update created colorway: clear the nullable column back to null
+POST http://localhost:4000/graphql
+Content-Type: application/json
+{
+  "query": "mutation { updateColorways(id: {{colorway_id}}, input: { hex: null }) { hex } }"
+}
+HTTP 200
+[Asserts]
+jsonpath "$.data.updateColorways.hex" == null
+
+# Cleanup created colorway
+POST http://localhost:4000/graphql
+Content-Type: application/json
+{
+  "query": "mutation { deleteColorways(id: {{colorway_id}}) { id } }"
+}
+HTTP 200
+[Asserts]
+jsonpath "$.data.deleteColorways.id" == {{colorway_id}}
+
 # Delete material
 POST http://localhost:4000/graphql
 Content-Type: application/json

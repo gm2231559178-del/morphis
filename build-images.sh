@@ -49,6 +49,7 @@ echo "=== Building tests:local ==="
 mkdir -p "$TMP_DIR/tests"
 cp "$SCRIPT_DIR/seed_es.sh" "$TMP_DIR/tests/"
 cp -r "$SCRIPT_DIR/tests/"* "$TMP_DIR/tests/"
+cp -r "$SCRIPT_DIR/contract/" "$TMP_DIR/tests/contract/"
 cp -r "$SCRIPT_DIR/benchmark/" "$TMP_DIR/tests/benchmark/"
 cat > "$TMP_DIR/tests/Dockerfile" << 'DOCKERFILE'
 FROM ghcr.io/orange-opensource/hurl:latest

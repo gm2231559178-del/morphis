@@ -155,9 +155,9 @@ fn default_half_open_max() -> u64 {
 }
 
 impl CircuitBreakerInstanceConfig {
-    pub fn to_circuit_breaker_config(&self) -> crate::circuit_breaker::CircuitBreakerConfig {
+    pub fn to_circuit_breaker_config(&self) -> identity_auth::circuit_breaker::CircuitBreakerConfig {
         use std::time::Duration;
-        crate::circuit_breaker::CircuitBreakerConfig {
+        identity_auth::circuit_breaker::CircuitBreakerConfig {
             failure_threshold: self.failure_threshold,
             reset_timeout: Duration::from_secs(self.reset_timeout_secs),
             half_open_max_requests: self.half_open_max_requests,
@@ -245,45 +245,6 @@ impl RowFilterConfig {
 
 fn default_auto_set() -> bool {
     true
-}
-
-#[derive(Debug, Clone)]
-pub struct PermissionCacheEntry {
-    pub values: Vec<serde_json::Value>,
-    pub expires_at: std::time::Instant,
-}
-
-#[derive(Debug, Clone)]
-pub struct PermissionCache {
-    store: std::collections::HashMap<String, PermissionCacheEntry>,
-}
-
-impl PermissionCache {
-    pub fn new() -> Self {
-        Self {
-            store: std::collections::HashMap::new(),
-        }
-    }
-
-    pub fn get(&self, key: &str) -> Option<Vec<serde_json::Value>> {
-        self.store.get(key).and_then(|entry| {
-            if std::time::Instant::now() < entry.expires_at {
-                Some(entry.values.clone())
-            } else {
-                None
-            }
-        })
-    }
-
-    pub fn set(&mut self, key: String, values: Vec<serde_json::Value>, ttl: std::time::Duration) {
-        self.store.insert(
-            key,
-            PermissionCacheEntry {
-                expires_at: std::time::Instant::now() + ttl,
-                values,
-            },
-        );
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

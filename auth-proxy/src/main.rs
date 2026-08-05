@@ -2,41 +2,17 @@ mod config;
 
 use std::sync::Arc;
 
-use jsonwebtoken::jwk::{JwkSet, PublicKeyUse};
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+use identity_auth::AuthPolicy;
 use pingora::proxy::{ProxyHttp, Session};
 use pingora::server::Server;
 use pingora::upstreams::peer::HttpPeer;
-use serde::Deserialize;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::config::ProxyConfig;
 
-#[derive(Debug, Deserialize)]
-struct Claims {
-    #[serde(default)]
-    sub: String,
-    #[serde(flatten)]
-    extra: std::collections::HashMap<String, serde_json::Value>,
-}
-
 struct AuthProxy {
     config: Arc<ProxyConfig>,
-    decoding_key: Option<DecodingKey>,
-    jwks_keys: Vec<DecodingKey>,
-}
-
-impl AuthProxy {
-    fn header_value_from_claims(claims: &Claims, claim_name: &str) -> Option<String> {
-        if claim_name == "sub" {
-            return Some(claims.sub.clone());
-        }
-        claims
-            .extra
-            .get(claim_name)
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    }
+    authenticator: identity_auth::Authenticator,
 }
 
 #[async_trait::async_trait]
@@ -90,100 +66,22 @@ impl ProxyHttp for AuthProxy {
             }
         };
 
-        let claims = if !self.jwks_keys.is_empty() {
-            let algorithm = Algorithm::RS256;
-            let mut validation = Validation::new(algorithm);
-            if !self.config.jwt_issuer.is_empty() {
-                validation.set_issuer(&[&self.config.jwt_issuer]);
+        let identity = match self.authenticator.authenticate(token).await {
+            Ok(identity) => identity,
+            Err(e) => {
+                warn!(error = %e, "JWT validation failed");
+                session.respond_error(401).await?;
+                return Ok(true);
             }
-            validation.validate_aud = false;
-
-            let mut result = None;
-            for key in &self.jwks_keys {
-                if let Ok(data) = decode::<Claims>(token, key, &validation) {
-                    result = Some(data.claims);
-                    break;
-                }
-            }
-            match result {
-                Some(c) => c,
-                None => {
-                    if let Some(ref key) = self.decoding_key {
-                        let mut hs_validation = Validation::new(Algorithm::HS256);
-                        hs_validation.validate_exp = false;
-                        hs_validation.required_spec_claims.clear();
-                        match decode::<Claims>(token, key, &hs_validation) {
-                            Ok(data) => data.claims,
-                            Err(e) => {
-                                warn!(error = %e, "JWT validation failed with JWKS and HS256");
-                                session.respond_error(401).await?;
-                                return Ok(true);
-                            }
-                        }
-                    } else {
-                        warn!("JWT validation failed with all JWKS keys (no HS256 fallback)");
-                        session.respond_error(401).await?;
-                        return Ok(true);
-                    }
-                }
-            }
-        } else if let Some(ref key) = self.decoding_key {
-            let mut validation = Validation::new(Algorithm::HS256);
-            validation.validate_exp = false;
-            validation.required_spec_claims.clear();
-            match decode::<Claims>(token, key, &validation) {
-                Ok(data) => data.claims,
-                Err(e) => {
-                    warn!(error = %e, "JWT validation failed");
-                    session.respond_error(401).await?;
-                    return Ok(true);
-                }
-            }
-        } else {
-            error!("No JWT validation keys configured");
-            session.respond_error(500).await?;
-            return Ok(true);
         };
 
         trace!("Auth proxy: request authenticated successfully");
-        for mapping in &self.config.header_mappings {
-            if let Some(val) = Self::header_value_from_claims(&claims, &mapping.claim) {
-                let name = mapping.header.clone();
-                let _ = session.req_header_mut().insert_header(name, val);
-            }
+        for (name, value) in identity.into_headers() {
+            let _ = session.req_header_mut().insert_header(name, value);
         }
 
         Ok(false)
     }
-}
-
-fn fetch_jwks(url: &str) -> anyhow::Result<Vec<DecodingKey>> {
-    let resp = ureq::get(url).call()?;
-    let jwk_set: JwkSet = resp.into_body().read_json()?;
-    let mut keys = Vec::new();
-    for jwk in &jwk_set.keys {
-        // Only use signing keys, skip encryption keys
-        if let Some(ref use_val) = jwk.common.public_key_use
-            && !matches!(use_val, PublicKeyUse::Signature)
-        {
-            debug!(
-                kid = ?jwk.common.key_id,
-                "Skipping JWK with non-signature use"
-            );
-            continue;
-        }
-        match DecodingKey::from_jwk(jwk) {
-            Ok(key) => keys.push(key),
-            Err(e) => {
-                debug!(kid = ?jwk.common.key_id, error = %e, "Skipping JWK");
-            }
-        }
-    }
-    if keys.is_empty() {
-        anyhow::bail!("No usable JWKS keys found from {}", url);
-    }
-    info!("Loaded {} JWKS keys from {}", keys.len(), url);
-    Ok(keys)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -208,18 +106,55 @@ fn main() -> anyhow::Result<()> {
         config.listen_addr, config.upstream
     );
 
-    let jwks_keys = if !config.jwt_jwks_url.is_empty() {
-        fetch_jwks(&config.jwt_jwks_url)?
-    } else {
-        Vec::new()
-    };
-    let decoding_key = if !config.jwt_secret.is_empty() {
-        Some(DecodingKey::from_secret(config.jwt_secret.as_bytes()))
-    } else {
+    let jwks_url = if config.jwt_jwks_url.is_empty() {
         None
+    } else {
+        Some(config.jwt_jwks_url.clone())
     };
-    if jwks_keys.is_empty() && decoding_key.is_none() {
+    let jwt_secret = if config.jwt_secret.is_empty() {
+        None
+    } else {
+        Some(config.jwt_secret.clone())
+    };
+    if jwks_url.is_none() && jwt_secret.is_none() {
         anyhow::bail!("Either jwt_secret or jwt_jwks_url must be configured");
+    }
+    let issuer = (!config.jwt_issuer.is_empty()).then(|| config.jwt_issuer.clone());
+
+    let authenticator = identity_auth::Authenticator::new(AuthPolicy {
+        jwt_secret,
+        jwks_url,
+        issuer,
+        audience: None,
+        // The frontend's self-signed HS256 tokens carry no `exp` — expiry is enforced
+        // on the JWKS path only (Keycloak tokens always carry a valid `exp`).
+        require_exp_secret: false,
+        require_exp_jwks: true,
+        // Keycloak tokens carry `aud: "account"` (the client id), not the proxy.
+        validate_audience: false,
+        identity_mappings: config
+            .header_mappings
+            .iter()
+            .map(|m| identity_auth::IdentityMapping {
+                claim: m.claim.clone(),
+                header: m.header.clone(),
+            })
+            .collect(),
+        jwks_circuit_breaker: config.jwks_circuit_breaker.clone().map(|c| {
+            identity_auth::circuit_breaker::CircuitBreakerConfig {
+                failure_threshold: c.failure_threshold,
+                reset_timeout: std::time::Duration::from_secs(c.reset_timeout_secs),
+                half_open_max_requests: c.half_open_max_requests,
+            }
+        }),
+    });
+
+    // Preserve the historical fail-fast behaviour: an unreachable JWKS endpoint aborts
+    // startup instead of only surfacing on the first request. A throwaway runtime is used
+    // because pingora owns the long-lived one inside `Server::run_forever`.
+    {
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(authenticator.warm_jwks())?;
     }
 
     let mut server = Server::new(None)?;
@@ -229,8 +164,7 @@ fn main() -> anyhow::Result<()> {
         &server.configuration,
         AuthProxy {
             config: config.clone(),
-            decoding_key,
-            jwks_keys,
+            authenticator,
         },
     );
     proxy_service.add_tcp(&config.listen_addr);

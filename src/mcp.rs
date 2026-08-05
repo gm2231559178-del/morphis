@@ -5,7 +5,6 @@ use std::time::Duration;
 use axum::http::{HeaderValue, Request, header};
 use axum::middleware;
 use axum::response::Response;
-use jsonwebtoken::{DecodingKey, Validation};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
@@ -14,16 +13,9 @@ use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_router};
-use sqlx::{Pool, Postgres};
 
-use crate::circuit_breaker::CircuitBreaker;
-use crate::config::{Config, MCPAuthConfig};
-use crate::schema::AppContext;
+use crate::config::Config;
 use crate::schema::Identity;
-
-tokio::task_local! {
-    pub static MCP_IDENTITY: Identity;
-}
 
 /// Cache for `graphql_schema` results — schema is static for the server lifetime.
 static SCHEMA_CACHE: OnceLock<String> = OnceLock::new();
@@ -32,29 +24,23 @@ static SCHEMA_CACHE: OnceLock<String> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct MCPState {
-    pub auth_config: Option<Arc<MCPAuthConfig>>,
-    #[allow(dead_code)]
-    pub app_context: Arc<AppContext>,
-    #[allow(dead_code)]
-    pub config: Arc<Config>,
-    pub jwks_circuit_breaker: Option<CircuitBreaker>,
+    pub authenticator: Option<identity_auth::Authenticator>,
 }
 
 // ── MCP Server ─────────────────────────────────────────────────
 
 pub struct MorphisMCPServer {
     config: Arc<Config>,
-    #[allow(dead_code)]
-    app_context: Arc<AppContext>,
+    schema: async_graphql::dynamic::Schema,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl MorphisMCPServer {
-    pub fn new(config: Arc<Config>, app_context: Arc<AppContext>) -> Self {
+    pub fn new(config: Arc<Config>, schema: async_graphql::dynamic::Schema) -> Self {
         Self {
             config,
-            app_context,
+            schema,
             tool_router: Self::tool_router(),
         }
     }
@@ -223,60 +209,43 @@ impl MorphisMCPServer {
     #[tool(
         description = "Execute any GraphQL query against the API. Supports nested relations, filtering, pagination, and mutations. Example: { materialsList(limit: 3) { mat_no name sizes { size_code } } }"
     )]
-    #[tracing::instrument(skip(self), fields(query_preview = %args.query.chars().take(80).collect::<String>()))]
+    #[tracing::instrument(skip(self, ctx), fields(query_preview = %args.query.chars().take(80).collect::<String>()))]
     async fn graphql(
         &self,
         Parameters(args): Parameters<GraphqlArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let url = format!("http://localhost:{}/graphql", self.config.server.port);
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| {
-                McpError::internal_error(
-                    format!("Failed to create HTTP client: {}", e),
-                    None::<serde_json::Value>,
-                )
-            })?;
-        let mut body = serde_json::json!({ "query": args.query });
+        let mut request = async_graphql::Request::new(args.query);
         if let Some(vars) = args.variables {
-            body["variables"] = vars;
+            request = request.variables(async_graphql::Variables::from_json(vars));
         }
 
-        let resp = client.post(&url).json(&body).send().await.map_err(|e| {
-            McpError::internal_error(
-                format!("GraphQL request failed: {}", e),
-                None::<serde_json::Value>,
-            )
-        })?;
+        let identity = identity_from_extensions(&ctx.extensions);
+        let resp = crate::schema::execute(&self.schema, request, identity).await;
 
-        let text = resp.text().await.map_err(|e| {
+        let value = serde_json::to_value(&resp).map_err(|e| {
             McpError::internal_error(
-                format!("Failed to read GraphQL response: {}", e),
+                format!("Failed to serialize GraphQL response: {}", e),
                 None::<serde_json::Value>,
             )
         })?;
 
         // Surface GraphQL errors as tool errors so the LLM gets clear feedback
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
-            if let Some(errors) = parsed.get("errors") {
-                tracing::warn!(
-                    errors = %serde_json::to_string_pretty(errors).unwrap_or_default(),
-                    "MCP graphql returned errors"
-                );
-                return Err(McpError::internal_error(
-                    format!(
-                        "GraphQL errors: {}",
-                        serde_json::to_string_pretty(errors).unwrap_or_default()
-                    ),
-                    None::<serde_json::Value>,
-                ));
-            }
-            let formatted = serde_json::to_string_pretty(&parsed).unwrap_or(text);
-            Ok(CallToolResult::success(vec![Content::text(formatted)]))
-        } else {
-            Ok(CallToolResult::success(vec![Content::text(text)]))
+        if let Some(errors) = value.get("errors") {
+            tracing::warn!(
+                errors = %serde_json::to_string_pretty(errors).unwrap_or_default(),
+                "MCP graphql returned errors"
+            );
+            return Err(McpError::internal_error(
+                format!(
+                    "GraphQL errors: {}",
+                    serde_json::to_string_pretty(errors).unwrap_or_default()
+                ),
+                None::<serde_json::Value>,
+            ));
         }
+        let formatted = serde_json::to_string_pretty(&value).unwrap_or_default();
+        Ok(CallToolResult::success(vec![Content::text(formatted)]))
     }
 
     /// Introspect the GraphQL schema and return every available query with its arguments, return type, and nested fields.
@@ -294,7 +263,6 @@ impl MorphisMCPServer {
         }
         tracing::debug!("MCP graphql_schema: building schema (cache miss)");
 
-        let url = format!("http://localhost:{}/graphql", self.config.server.port);
         let introspect_query = r#"
         {
           __schema {
@@ -315,34 +283,23 @@ impl MorphisMCPServer {
         }
         "#;
 
-        let client = reqwest::Client::new();
-        let resp = client
-            .post(&url)
-            .json(&serde_json::json!({ "query": introspect_query }))
-            .send()
-            .await
-            .map_err(|e| {
-                McpError::internal_error(
-                    format!("Introspection request failed: {}", e),
-                    None::<serde_json::Value>,
-                )
-            })?;
-
-        let data: serde_json::Value = resp.json().await.map_err(|e| {
+        let request = async_graphql::Request::new(introspect_query);
+        let resp = crate::schema::execute(&self.schema, request, Identity::default()).await;
+        let data = serde_json::to_value(&resp.data).map_err(|e| {
             McpError::internal_error(
-                format!("Failed to parse introspection response: {}", e),
+                format!("Failed to serialize introspection response: {}", e),
                 None::<serde_json::Value>,
             )
         })?;
 
-        let fields = data["data"]["__schema"]["queryType"]["fields"]
+        let fields = data["__schema"]["queryType"]["fields"]
             .as_array()
             .cloned()
             .unwrap_or_default();
 
         let mut type_fields: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
-        if let Some(types) = data["data"]["__schema"]["types"].as_array() {
+        if let Some(types) = data["__schema"]["types"].as_array() {
             for t in types {
                 let tname = t["name"].as_str().unwrap_or("");
                 if tname.starts_with("__") {
@@ -528,8 +485,8 @@ async fn mcp_auth_middleware(
     mut req: Request<axum::body::Body>,
     next: middleware::Next,
 ) -> Response {
-    let identity = match &state.auth_config {
-        Some(auth_cfg) if auth_cfg.enabled => {
+    let identity = match &state.authenticator {
+        Some(authenticator) => {
             let token = req
                 .headers()
                 .get(header::AUTHORIZATION)
@@ -538,34 +495,19 @@ async fn mcp_auth_middleware(
                 .map(|s| s.to_string());
 
             match token {
-                Some(token) => {
-                    match validate_jwt(&token, auth_cfg, state.jwks_circuit_breaker.as_ref()).await
-                    {
-                        Ok(claims) => {
-                            let mut headers = std::collections::HashMap::new();
-                            for mapping in &auth_cfg.identity_mappings {
-                                if let Some(val) = claims.get(&mapping.claim) {
-                                    if let Some(s) = val.as_str() {
-                                        headers
-                                            .insert(mapping.header.to_lowercase(), s.to_string());
-                                    } else {
-                                        headers
-                                            .insert(mapping.header.to_lowercase(), val.to_string());
-                                    }
-                                }
-                            }
-                            tracing::trace!("MCP auth succeeded");
-                            Identity::from_raw(headers)
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "MCP JWT validation failed");
-                            return Response::builder()
-                                .status(401)
-                                .body(axum::body::Body::from("Unauthorized"))
-                                .unwrap();
-                        }
+                Some(token) => match crate::auth::validate_identity(authenticator, &token).await {
+                    Ok(identity) => {
+                        tracing::trace!("MCP auth succeeded");
+                        identity
                     }
-                }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "MCP JWT validation failed");
+                        return Response::builder()
+                            .status(401)
+                            .body(axum::body::Body::from("Unauthorized"))
+                            .unwrap();
+                    }
+                },
                 None => {
                     tracing::warn!("MCP request without Bearer token (rejected)");
                     return Response::builder()
@@ -575,7 +517,7 @@ async fn mcp_auth_middleware(
                 }
             }
         }
-        _ => {
+        None => {
             let headers = req
                 .headers()
                 .iter()
@@ -590,200 +532,55 @@ async fn mcp_auth_middleware(
         }
     };
 
-    MCP_IDENTITY
-        .scope(identity, async move {
-            // Ensure MCP requests have proper Accept header
-            if req.uri().path().starts_with("/mcp") && !req.headers().contains_key(header::ACCEPT) {
-                req.headers_mut().insert(
-                    header::ACCEPT,
-                    HeaderValue::from_static("application/json, text/event-stream"),
-                );
-            }
-            next.run(req).await
-        })
-        .await
-}
-
-async fn validate_jwt(
-    token: &str,
-    auth: &MCPAuthConfig,
-    jwks_breaker: Option<&CircuitBreaker>,
-) -> Result<serde_json::Value, String> {
-    use jsonwebtoken::decode_header;
-
-    let header = decode_header(token).map_err(|e| {
-        tracing::warn!(error = %e, "MCP JWT header decode failed");
-        format!("JWT header decode failed: {}", e)
-    })?;
-    let kid = header.kid.clone();
-
-    if let Some(ref secret) = auth.jwt_secret {
-        let mut validation = Validation::new(header.alg);
-        if let Some(ref issuer) = auth.issuer {
-            validation.set_issuer(&[issuer.as_str()]);
-        }
-        if let Some(ref aud) = auth.audience {
-            validation.set_audience(&[aud.as_str()]);
-        }
-        validation.validate_exp = true;
-
-        let data = jsonwebtoken::decode::<serde_json::Value>(
-            token,
-            &DecodingKey::from_secret(secret.as_bytes()),
-            &validation,
-        )
-        .map_err(|e| {
-            tracing::warn!(error = %e, "MCP JWT HS256 validation failed");
-            format!("JWT validation failed: {}", e)
-        })?;
-        Ok(data.claims)
-    } else if let Some(ref jwks_url) = auth.jwks_url {
-        let jwks = fetch_jwks(jwks_url, jwks_breaker).await.map_err(|e| {
-            tracing::error!(url = %jwks_url, error = %e, "Failed to fetch JWKS");
-            e
-        })?;
-        let key = find_key(&jwks, kid.as_deref()).ok_or_else(|| {
-            tracing::warn!(kid = ?kid, "No matching JWK key found");
-            "No matching JWK key found".to_string()
-        })?;
-
-        let decoding_key = jwk_to_decoding_key(key)?;
-        let mut validation = Validation::new(header.alg);
-        if let Some(ref issuer) = auth.issuer {
-            validation.set_issuer(&[issuer.as_str()]);
-        }
-        if let Some(ref aud) = auth.audience {
-            validation.set_audience(&[aud.as_str()]);
-        }
-        validation.validate_exp = true;
-
-        let data = jsonwebtoken::decode::<serde_json::Value>(token, &decoding_key, &validation)
-            .map_err(|e| {
-                tracing::warn!(error = %e, "MCP JWT JWKS validation failed");
-                format!("JWT validation failed: {}", e)
-            })?;
-        Ok(data.claims)
-    } else {
-        tracing::warn!("MCP JWT: no jwt_secret or jwks_url configured");
-        Err("No jwt_secret or jwks_url configured".into())
+    // Ensure MCP requests have proper Accept header
+    if req.uri().path().starts_with("/mcp") && !req.headers().contains_key(header::ACCEPT) {
+        req.headers_mut().insert(
+            header::ACCEPT,
+            HeaderValue::from_static("application/json, text/event-stream"),
+        );
     }
-}
-
-async fn fetch_jwks(
-    url: &str,
-    breaker: Option<&CircuitBreaker>,
-) -> Result<serde_json::Value, String> {
-    let client = reqwest::Client::new();
-    let body = match breaker {
-        Some(cb) => cb
-            .call(|| async { client.get(url).send().await })
-            .await
-            .map_err(|e| {
-                tracing::warn!(error = %e, "MCP JWKS fetch failed (circuit breaker)");
-                e.to_string()
-            })?,
-        None => client.get(url).send().await.map_err(|e| {
-            tracing::warn!(error = %e, "MCP JWKS fetch failed");
-            format!("JWKS fetch failed: {}", e)
-        })?,
-    };
-    let body = body
-        .text()
-        .await
-        .map_err(|e| format!("JWKS body read failed: {}", e))?;
-    tracing::debug!(url = %url, "Fetched JWKS keys");
-    serde_json::from_str(&body).map_err(|e| format!("JWKS parse failed: {}", e))
-}
-
-fn find_key<'a>(jwks: &'a serde_json::Value, kid: Option<&str>) -> Option<&'a serde_json::Value> {
-    let keys = jwks["keys"].as_array()?;
-    if let Some(kid) = kid {
-        keys.iter().find(|k| k["kid"].as_str() == Some(kid))
-    } else {
-        keys.first()
-    }
-}
-
-fn jwk_to_decoding_key(jwk: &serde_json::Value) -> Result<DecodingKey, String> {
-    let kty = jwk["kty"].as_str().unwrap_or("");
-    match kty {
-        "RSA" => {
-            let n = jwk["n"].as_str().ok_or("Missing RSA modulus 'n'")?;
-            let e = jwk["e"].as_str().ok_or("Missing RSA exponent 'e'")?;
-            Ok(DecodingKey::from_rsa_components(n, e)
-                .map_err(|e| format!("RSA key error: {}", e))?)
-        }
-        "EC" => {
-            let x = jwk["x"].as_str().ok_or("Missing EC x")?;
-            let y = jwk["y"].as_str().ok_or("Missing EC y")?;
-            Ok(
-                DecodingKey::from_ec_components(x, y)
-                    .map_err(|e| format!("EC key error: {}", e))?,
-            )
-        }
-        "oct" => {
-            let k = jwk["k"].as_str().ok_or("Missing symmetric key 'k'")?;
-            use base64::Engine;
-            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(k)
-                .map_err(|e| format!("Base64 decode failed: {}", e))?;
-            Ok(DecodingKey::from_secret(&bytes))
-        }
-        _ => Err(format!("Unsupported key type: {}", kty)),
-    }
+    // Carry the identity to the tool via the request extensions — rmcp surfaces the original
+    // HTTP request parts to tools, so the tool reads it back from `ctx.extensions`.
+    req.extensions_mut().insert(identity);
+    next.run(req).await
 }
 
 // ── Axum Router Builder ────────────────────────────────────────
 
-pub fn build_mcp_router(config: Arc<Config>, pool: Pool<Postgres>) -> Option<axum::Router> {
+pub fn build_mcp_router(
+    config: Arc<Config>,
+    schema: async_graphql::dynamic::Schema,
+) -> Option<axum::Router> {
     let mcp_cfg = config.mcp.as_ref()?;
     if !mcp_cfg.enabled {
         return None;
     }
 
-    let es_client = config
-        .elasticsearch
-        .as_ref()
-        .map(|_| reqwest::Client::new());
-    let es_url = config.elasticsearch.as_ref().map(|c| c.url.clone());
-    let es_circuit_breaker = config
-        .elasticsearch
-        .as_ref()
-        .map(|_| CircuitBreaker::new(config.circuit_breakers.es.to_circuit_breaker_config()));
-    let app_context = Arc::new(AppContext {
-        pool,
-        es_client,
-        es_url,
-        es_circuit_breaker,
-        permission_cache: Arc::new(tokio::sync::Mutex::new(
-            crate::config::PermissionCache::new(),
-        )),
-    });
-
-    let auth_config = mcp_cfg
+    let authenticator = mcp_cfg
         .auth
         .as_ref()
         .filter(|a| a.enabled)
-        .cloned()
-        .map(Arc::new);
+        .map(|a| {
+            crate::auth::authenticator(
+                a.jwt_secret.as_deref(),
+                a.jwks_url.as_deref(),
+                a.issuer.as_deref(),
+                a.audience.as_deref(),
+                true,
+                &a.identity_mappings,
+                a.jwks_url
+                    .as_ref()
+                    .map(|_| config.circuit_breakers.jwks.clone()),
+            )
+        });
 
-    let jwks_circuit_breaker = auth_config
-        .as_ref()
-        .and_then(|a| a.jwks_url.as_ref())
-        .map(|_| CircuitBreaker::new(config.circuit_breakers.jwks.to_circuit_breaker_config()));
-
-    let mcp_state = MCPState {
-        auth_config,
-        app_context: app_context.clone(),
-        config: config.clone(),
-        jwks_circuit_breaker,
-    };
+    let mcp_state = MCPState { authenticator };
 
     let service = StreamableHttpService::new(
         {
             let config = config.clone();
-            let app_context = app_context.clone();
-            move || Ok(MorphisMCPServer::new(config.clone(), app_context.clone()))
+            let schema = schema.clone();
+            move || Ok(MorphisMCPServer::new(config.clone(), schema.clone()))
         },
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default()
@@ -803,6 +600,48 @@ pub fn build_mcp_router(config: Arc<Config>, pool: Pool<Postgres>) -> Option<axu
     tracing::info!("MCP server enabled at /mcp (Streamable HTTP)");
 
     Some(router)
+}
+
+// ── Identity threading ─────────────────────────────────────────
+
+/// Extract the request identity injected by the auth middleware from the tool's
+/// request context. rmcp injects the original `http::request::Parts` (which carries
+/// the axum extensions) into every tool request's `RequestContext`.
+fn identity_from_extensions(extensions: &rmcp::model::Extensions) -> Identity {
+    extensions
+        .get::<axum::http::request::Parts>()
+        .and_then(|parts| parts.extensions.get::<Identity>())
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_extracted_from_request_extensions() {
+        let (mut parts, _) = axum::http::Request::builder()
+            .uri("/mcp")
+            .body(axum::body::Body::empty())
+            .unwrap()
+            .into_parts();
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("x-tenant-id".to_string(), "tenant-a".to_string());
+        parts.extensions.insert(Identity::from_raw(headers));
+
+        let mut extensions = rmcp::model::Extensions::new();
+        extensions.insert(parts);
+
+        let identity = identity_from_extensions(&extensions);
+        assert_eq!(identity.header_value("x-tenant-id"), Some("tenant-a"));
+    }
+
+    #[test]
+    fn identity_defaults_to_anonymous_when_missing() {
+        let identity = identity_from_extensions(&rmcp::model::Extensions::new());
+        assert_eq!(identity.header_value("x-tenant-id"), None);
+    }
 }
 
 // ── Filter Parsing ──────────────────────────────────────────────
