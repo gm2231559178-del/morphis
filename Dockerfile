@@ -13,7 +13,7 @@ RUN mkdir -p src auth-proxy/src identity-auth/src && \
 
 COPY src/ src/
 COPY identity-auth/src/ identity-auth/src/
-RUN touch src/main.rs && cargo build --release -p morphis
+RUN touch src/main.rs identity-auth/src/lib.rs && cargo build --release -p morphis
 
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates
