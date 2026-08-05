@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use async_graphql::{
     Name, Value,
+    dataloader::DataLoader,
     dynamic::{
         Field, FieldFuture, FieldValue, InputObject, InputValue, Object, ObjectAccessor,
         ResolverContext, TypeRef, ValueAccessor,
@@ -11,6 +12,7 @@ use async_graphql::{
 use crate::config::{ColumnConfig, ColumnType, Config, RelationType, RowFilterConfig, TableConfig};
 
 use super::db;
+use super::relation::{RelKey, RelSpec, RelationLoader, build_filter_suffix, relation_field_value};
 use super::search::apply_row_filters;
 use super::util::{capitalize_first, gql_val, gql_value_to_sql_string, value_as_string};
 use super::{AppContext, Identity};
@@ -172,7 +174,6 @@ fn build_relation_field(
     let fk_pairs = rel.field_pairs();
     let local_fields: Vec<String> = fk_pairs.iter().map(|(l, _)| l.to_string()).collect();
     let foreign_fields: Vec<String> = fk_pairs.iter().map(|(_, f)| f.to_string()).collect();
-    let int_check: Vec<bool> = fk_pairs.iter().map(|(_, f)| is_int_col(rel_cfg, f)).collect();
     let is_list = matches!(rel.rel_type, RelationType::HasMany);
     let rel_table = rel.table.clone();
     let order_by = if is_list {
@@ -189,7 +190,6 @@ fn build_relation_field(
     Field::new(rel.name.clone(), return_type, move |ctx| {
         let local_fields = local_fields.clone();
         let foreign_fields = foreign_fields.clone();
-        let int_check = int_check.clone();
         let rel_table = rel_table.clone();
         let order_by = order_by.clone();
         let row_filters = row_filters.clone();
@@ -201,58 +201,46 @@ fn build_relation_field(
                 .as_value()
                 .ok_or_else(|| async_graphql::Error::new("not a value"))?;
 
-            let mut where_clauses = Vec::new();
-            let mut params = Vec::new();
-            for (i, ((local_f, foreign_f), is_int)) in local_fields
+            let fk = local_fields
                 .iter()
-                .zip(foreign_fields.iter())
-                .zip(int_check.iter())
-                .enumerate()
-            {
-                let local_val = match &parent {
-                    Value::Object(map) => {
-                        map.get(&Name::new(local_f)).cloned().unwrap_or(Value::Null)
-                    }
-                    _ => Value::Null,
-                };
-                let val_str = gql_value_to_sql_string(&local_val);
-                let cast = if *is_int { "::int" } else { "" };
-                where_clauses.push(format!("{} = ${}{}", foreign_f, i + 1, cast));
-                params.push(val_str);
-            }
+                .map(|local_f| {
+                    let local_val = match &parent {
+                        Value::Object(map) => {
+                            map.get(&Name::new(local_f)).cloned().unwrap_or(Value::Null)
+                        }
+                        _ => Value::Null,
+                    };
+                    gql_value_to_sql_string(&local_val)
+                })
+                .collect::<Vec<_>>();
 
-            let mut sql = if is_list {
-                format!(
-                    "SELECT COALESCE(json_agg(row_to_json(t) ORDER BY {}), '[]'::json)::text FROM (SELECT * FROM {} WHERE {}",
-                    order_by, rel_table, where_clauses.join(" AND ")
-                )
-            } else {
-                format!(
-                    "SELECT row_to_json(t)::text FROM (SELECT * FROM {} WHERE {}",
-                    rel_table, where_clauses.join(" AND ")
-                )
+            let (filter_suffix, filter_params) =
+                if let Ok(identity) = ctx.data::<Identity>() {
+                    build_filter_suffix(identity, &row_filters, fk.len())
+                } else {
+                    (String::new(), Vec::new())
+                };
+
+            let spec = RelSpec {
+                table: rel_table,
+                foreign_fields,
+                is_list,
+                order_by,
+                filter_suffix,
+                filter_params,
             };
-            if let Ok(identity) = ctx.data::<Identity>() {
-                apply_row_filters(&mut sql, &mut params, identity, &row_filters);
-            }
-            sql.push_str(if is_list { ") t" } else { " LIMIT 1) t" });
-            let app_ctx = ctx
-                .data::<std::sync::Arc<AppContext>>()
+            let key = RelKey { spec, fk };
+
+            let loader = ctx
+                .data::<DataLoader<RelationLoader>>()
                 .map_err(|_| async_graphql::Error::new("internal context missing"))?;
 
-            if is_list {
-                let rows = db::fetch_rows(&app_ctx.pool, &sql, &db::text_binds(&params)).await?;
-                let items: Vec<FieldValue> = rows
-                    .into_iter()
-                    .map(|r| FieldValue::value(gql_val(r)))
-                    .collect();
-                Ok(Some(FieldValue::list(items)))
-            } else {
-                match db::fetch_json(&app_ctx.pool, &sql, &db::text_binds(&params)).await? {
-                    Some(row) => Ok(Some(FieldValue::value(gql_val(row)))),
-                    None => Ok(FieldValue::NONE),
-                }
-            }
+            let mut children = loader.load_many(vec![key.clone()]).await.map_err(|e| {
+                async_graphql::Error::new(e.message)
+            })?;
+            let items = children.remove(&key).unwrap_or_default();
+
+            Ok(relation_field_value(items, is_list))
         })
     })
 }

@@ -42,6 +42,7 @@ services:
       dockerfile: Dockerfile
     environment:
       MORPHIS_CONFIG: /app/config.yaml
+      RUST_LOG: morphis=debug
     depends_on:
       db:
         condition: service_healthy

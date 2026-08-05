@@ -1,4 +1,5 @@
 pub(crate) mod db;
+mod relation;
 mod search;
 mod table;
 mod util;
@@ -6,6 +7,7 @@ mod util;
 use std::sync::Arc;
 
 use async_graphql::dynamic::{Object, Scalar, Schema};
+use async_graphql::dataloader::DataLoader;
 use sqlx::{Pool, Postgres};
 
 use crate::config::Config;
@@ -46,10 +48,14 @@ pub(crate) async fn build_schema_with_search(
     pool: Pool<Postgres>,
     search_service: Arc<search::SearchService>,
 ) -> Schema {
-    let ctx = Arc::new(AppContext { pool });
+    let ctx = Arc::new(AppContext { pool: pool.clone() });
 
     let mut schema_builder = Schema::build("Query", Some("Mutation"), None);
     schema_builder = schema_builder.data(ctx);
+    schema_builder = schema_builder.data(DataLoader::new(
+        relation::RelationLoader::new(pool),
+        tokio::spawn,
+    ));
     schema_builder = schema_builder.register(Scalar::new("BigInt"));
 
     let mut query = Object::new("Query");

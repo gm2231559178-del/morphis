@@ -224,6 +224,28 @@ jsonpath "$.data.searchMaterials" count == 1
 jsonpath "$.data.searchMaterials[0].mat_no" == "M001"
 jsonpath "$.data.searchMaterials[0].material_features" count == 3
 
+# Nested relations on a search hit resolve through the batched relation loader:
+# sizes, colorways, and material_features -> feature_attributes must all return
+# full child data (N+1 regression: previously one SQL query per hit per level).
+POST http://localhost:4000/graphql
+Content-Type: application/json
+{
+  "query": "{ searchMaterials(query: \"plain\") { mat_no sizes { size_code } colorways { colorway_code } material_features { feature_name feature_attributes { attr_name attr_value } } } }"
+}
+HTTP 200
+[Asserts]
+jsonpath "$.data.searchMaterials" count == 1
+jsonpath "$.data.searchMaterials[0].mat_no" == "M001"
+jsonpath "$.data.searchMaterials[0].sizes" count == 3
+jsonpath "$.data.searchMaterials[0].sizes[*].size_code" contains "S"
+jsonpath "$.data.searchMaterials[0].sizes[*].size_code" contains "M"
+jsonpath "$.data.searchMaterials[0].sizes[*].size_code" contains "L"
+jsonpath "$.data.searchMaterials[0].colorways" count == 3
+jsonpath "$.data.searchMaterials[0].material_features" count == 3
+jsonpath "$.data.searchMaterials[0].material_features[0].feature_name" == "Construction"
+jsonpath "$.data.searchMaterials[0].material_features[0].feature_attributes[0].attr_name" == "weave_type"
+jsonpath "$.data.searchMaterials[0].material_features[0].feature_attributes[0].attr_value" == "plain"
+
 # Paging: limit returns fewer results
 POST http://localhost:4000/graphql
 Content-Type: application/json

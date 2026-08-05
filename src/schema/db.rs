@@ -61,3 +61,45 @@ pub(crate) async fn fetch_rows(
         None => vec![],
     })
 }
+
+/// Fetch `(fk_values, children)` pairs from a batched relation query, whose
+/// columns are `__fk` (text array) and `__children` (JSON array text).
+pub(crate) async fn fetch_fk_groups(
+    pool: &Pool<Postgres>,
+    sql: &str,
+    binds: &[Bind<'_>],
+) -> Result<Vec<(Vec<String>, Vec<serde_json::Value>)>, async_graphql::Error> {
+    let mut query = sqlx::query(sql);
+    for bind in binds {
+        match bind {
+            Bind::Text(s) => {
+                query = query.bind(s);
+            }
+            Bind::Array(v) => {
+                query = query.bind(v);
+            }
+        }
+    }
+    let rows = query.fetch_all(pool).await.map_err(|e| {
+        let msg = e.to_string();
+        tracing::error!(error = %msg, sql_preview = %sql.chars().take(200).collect::<String>(), "DB query failed");
+        async_graphql::Error::new(msg)
+    })?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let fk: Vec<String> = row
+            .try_get("__fk")
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let json_str: String = row
+            .try_get("__children")
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let children = serde_json::from_str::<serde_json::Value>(&json_str)
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let children = match children {
+            serde_json::Value::Array(arr) => arr,
+            val => vec![val],
+        };
+        out.push((fk, children));
+    }
+    Ok(out)
+}
