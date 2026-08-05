@@ -1,4 +1,5 @@
 pub(crate) mod db;
+mod relation;
 mod search;
 mod table;
 mod util;
@@ -6,6 +7,7 @@ mod util;
 use std::sync::Arc;
 
 use async_graphql::dynamic::{Object, Scalar, Schema};
+use async_graphql::dataloader::DataLoader;
 use sqlx::{Pool, Postgres};
 
 use crate::config::Config;
@@ -46,10 +48,14 @@ pub(crate) async fn build_schema_with_search(
     pool: Pool<Postgres>,
     search_service: Arc<search::SearchService>,
 ) -> Schema {
-    let ctx = Arc::new(AppContext { pool });
+    let ctx = Arc::new(AppContext { pool: pool.clone() });
 
     let mut schema_builder = Schema::build("Query", Some("Mutation"), None);
     schema_builder = schema_builder.data(ctx);
+    schema_builder = schema_builder.data(DataLoader::new(
+        relation::RelationLoader::new(pool),
+        tokio::spawn,
+    ));
     schema_builder = schema_builder.register(Scalar::new("BigInt"));
 
     let mut query = Object::new("Query");
@@ -75,6 +81,7 @@ pub(crate) async fn build_schema_with_search(
     for input_obj in search::operator_inputs() {
         schema_builder = schema_builder.register(input_obj);
     }
+    schema_builder = schema_builder.register(search::query_operator_enum());
 
     for index_cfg in &config.search_indexes {
         tracing::debug!("Registering search index: {}", index_cfg.name);
@@ -98,6 +105,7 @@ pub(crate) async fn build_schema_with_search(
             .get(&index_cfg.graphql_type)
             .map(|t| t.row_filters.clone())
             .unwrap_or_default();
+        schema_builder = schema_builder.register(search::build_search_hit_object(index_cfg));
         query = search::add_search_field(query, index_cfg, search_row_filters, search_service.clone());
     }
 

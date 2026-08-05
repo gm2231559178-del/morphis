@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use async_graphql::dynamic::{InputObject, InputValue, ObjectAccessor, TypeRef, ValueAccessor};
+use async_graphql::dynamic::{Enum, InputObject, InputValue, ObjectAccessor, TypeRef, ValueAccessor};
 
 use crate::config::{ColumnType, SearchIndexConfig, SearchJoinConfig, TableConfig};
 use crate::schema::util::{capitalize_first, capitalize_words};
@@ -113,6 +113,14 @@ pub(crate) fn operator_inputs() -> Vec<InputObject> {
             BOOLEAN_OPERATORS,
         ),
     ]
+}
+
+/// The `queryOperator` enum controlling how a `search{Index}` free-text query
+/// combines its terms across searchable fields.
+pub(crate) fn query_operator_enum() -> Enum {
+    Enum::new("QueryOperator")
+        .item("AND")
+        .item("OR")
 }
 
 fn lookup_column_type<'a>(

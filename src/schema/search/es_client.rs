@@ -94,20 +94,57 @@ impl StubEsClient {
         let bool_body = &body["query"]["bool"];
         let size = body.get("size").and_then(Value::as_u64).unwrap_or(u64::MAX);
         let from = body.get("from").and_then(Value::as_u64).unwrap_or(0);
-        let matched: Vec<Value> = self
+        let mut matched: Vec<(f64, &Value)> = self
             .docs
             .iter()
             .filter(|doc| bool_matches(bool_body, doc))
-            .cloned()
+            .map(|doc| (doc_score(bool_body, doc), doc))
             .collect();
+        matched.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         let hits: Vec<Value> = matched
             .iter()
             .skip(from as usize)
             .take(size as usize)
-            .map(|doc| serde_json::json!({ "_source": doc }))
+            .map(|(score, doc)| serde_json::json!({ "_source": doc, "_score": score }))
             .collect();
         serde_json::json!({ "hits": { "hits": hits } })
     }
+}
+
+/// Deterministic relevance score for the stub: the number of free-text query
+/// terms that matched the document (each matching term adds 1.0), so a document
+/// matching more terms outranks one matching fewer — mirroring the live client's
+/// relevance ordering. Filter-only queries (no `should` multi_match) score 0.0.
+fn doc_score(body: &Value, doc: &Value) -> f64 {
+    let Some(should) = body.get("should").and_then(Value::as_array) else {
+        return 0.0;
+    };
+    let mut score = 0.0;
+    for clause in should {
+        if let Some(multi_match) = clause.get("multi_match").and_then(Value::as_object) {
+            let needle = multi_match.get("query").and_then(Value::as_str).unwrap_or("");
+            let fields = multi_match
+                .get("fields")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for term in needle.split_whitespace() {
+                let matched = fields.iter().any(|field| {
+                    doc_at_path(doc, field)
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| s.to_lowercase().contains(&term.to_lowercase()))
+                });
+                if matched {
+                    score += 1.0;
+                }
+            }
+        }
+    }
+    score
 }
 
 fn bool_matches(body: &Value, doc: &Value) -> bool {
@@ -229,11 +266,20 @@ fn clause_matches(clause: &Value, doc: &Value) -> bool {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        return fields.iter().any(|field| {
-            doc_at_path(doc, field)
-                .and_then(Value::as_str)
-                .is_some_and(|s| s.to_lowercase().contains(&needle.to_lowercase()))
-        });
+        let terms = needle.split_whitespace().collect::<Vec<_>>();
+        let term_matches = |term: &str| {
+            fields.iter().any(|field| {
+                doc_at_path(doc, field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.to_lowercase().contains(&term.to_lowercase()))
+            })
+        };
+        let all_terms_required = multi_match.get("operator").and_then(Value::as_str) == Some("and");
+        return if all_terms_required {
+            !terms.is_empty() && terms.iter().all(|t| term_matches(t))
+        } else {
+            terms.iter().any(|t| term_matches(t))
+        };
     }
     false
 }

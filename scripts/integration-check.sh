@@ -53,5 +53,16 @@ check_step "Keycloak setup" python3 scripts/keycloak-setup.py
 check_step "Seed ES" bash seed_es.sh
 check_step "Run hurl tests" docker compose run --rm tests
 
+check_step "Verify N+1 is gone (relation_batch log)" bash -c '
+  LOGS=$(docker compose logs app 2>/dev/null | grep "relation_batch" || true)
+  if [ -z "$LOGS" ]; then
+    echo "  ERROR: no relation_batch log lines found in app output" >&2
+    exit 1
+  fi
+  echo "$LOGS" | grep -q "queries=1" || { echo "  ERROR: expected queries=1 but found: $LOGS" >&2; exit 1; }
+  echo "$LOGS"
+  echo "  OK: relation resolvers batched (queries=1, not N)"
+'
+
 echo ""
 echo "=== All backend checks passed ==="

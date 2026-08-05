@@ -200,8 +200,8 @@ FOUND=""
 for i in $(seq 1 45); do
   FOUND=$(curl -s -X POST http://app:4000/graphql \
     -H 'Content-Type: application/json' \
-    -d '{"query":"{ searchMaterials(query: \"\", filter: { material_features: { description: { eq: \"PIPELINE-REINDEX-PROBE\" } } }) { mat_no } }"}' \
-    | python3 -c "import json,sys; d=json.load(sys.stdin); r=d.get('data',{}).get('searchMaterials') or []; print(r[0]['mat_no'] if r else '')" 2>/dev/null || true)
+    -d '{"query":"{ searchMaterials(query: \"\", filter: { material_features: { description: { eq: \"PIPELINE-REINDEX-PROBE\" } } }) { node { mat_no } } }"}' \
+    | python3 -c "import json,sys; d=json.load(sys.stdin); r=d.get('data',{}).get('searchMaterials') or []; print(r[0]['node']['mat_no'] if r else '')" 2>/dev/null || true)
   if [ "$FOUND" = "M003" ]; then
     echo "  PASS: child write re-indexed parent M003"
     break
@@ -223,8 +223,8 @@ FOUND=""
 for i in $(seq 1 45); do
   FOUND=$(curl -s -X POST http://app:4000/graphql \
     -H 'Content-Type: application/json' \
-    -d '{"query":"{ searchMaterials(query: \"\", filter: { material_features: { feature_attributes: { attr_value: { eq: \"PIPELINE-ATTR-PROBE\" } } } }) { mat_no } }"}' \
-    | python3 -c "import json,sys; d=json.load(sys.stdin); r=d.get('data',{}).get('searchMaterials') or []; print(r[0]['mat_no'] if r else '')" 2>/dev/null || true)
+    -d '{"query":"{ searchMaterials(query: \"\", filter: { material_features: { feature_attributes: { attr_value: { eq: \"PIPELINE-ATTR-PROBE\" } } } }) { node { mat_no } } }"}' \
+    | python3 -c "import json,sys; d=json.load(sys.stdin); r=d.get('data',{}).get('searchMaterials') or []; print(r[0]['node']['mat_no'] if r else '')" 2>/dev/null || true)
   if [ "$FOUND" = "M003" ]; then
     echo "  PASS: nested child write re-indexed parent M003"
     break
