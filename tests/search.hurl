@@ -234,6 +234,61 @@ HTTP 200
 [Asserts]
 jsonpath "$.data.searchMaterials" count == 1
 
+# queryOperator: AND requires every term to match — "cotton canvas" only in M001
+POST http://localhost:4000/graphql
+Content-Type: application/json
+{
+  "query": "{ searchMaterials(query: \"cotton canvas\", queryOperator: AND) { mat_no name } }"
+}
+HTTP 200
+[Asserts]
+jsonpath "$.data.searchMaterials" count == 1
+jsonpath "$.data.searchMaterials[0].mat_no" == "M001"
+
+# queryOperator: OR matches any term — "wool canvas" is M001 (canvas) + M002 (wool)
+POST http://localhost:4000/graphql
+Content-Type: application/json
+{
+  "query": "{ searchMaterials(query: \"wool canvas\", queryOperator: OR) { mat_no name } }"
+}
+HTTP 200
+[Asserts]
+jsonpath "$.data.searchMaterials" count == 2
+jsonpath "$.data.searchMaterials[*].mat_no" contains "M001"
+jsonpath "$.data.searchMaterials[*].mat_no" contains "M002"
+
+# queryOperator: AND with no document holding both terms returns nothing
+POST http://localhost:4000/graphql
+Content-Type: application/json
+{
+  "query": "{ searchMaterials(query: \"wool canvas\", queryOperator: AND) { mat_no name } }"
+}
+HTTP 200
+[Asserts]
+jsonpath "$.data.searchMaterials" count == 0
+
+# default queryOperator is OR — "wool canvas" matches either term
+POST http://localhost:4000/graphql
+Content-Type: application/json
+{
+  "query": "{ searchMaterials(query: \"wool canvas\") { mat_no name } }"
+}
+HTTP 200
+[Asserts]
+jsonpath "$.data.searchMaterials" count == 2
+jsonpath "$.data.searchMaterials[*].mat_no" contains "M001"
+jsonpath "$.data.searchMaterials[*].mat_no" contains "M002"
+
+# queryOperator ignored when query is empty
+POST http://localhost:4000/graphql
+Content-Type: application/json
+{
+  "query": "{ searchMaterials(query: \"\", queryOperator: AND) { mat_no } }"
+}
+HTTP 200
+[Asserts]
+jsonpath "$.data.searchMaterials" count == 3
+
 # Paging: limit of 2 on all results
 POST http://localhost:4000/graphql
 Content-Type: application/json

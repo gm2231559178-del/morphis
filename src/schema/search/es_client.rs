@@ -229,11 +229,20 @@ fn clause_matches(clause: &Value, doc: &Value) -> bool {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        return fields.iter().any(|field| {
-            doc_at_path(doc, field)
-                .and_then(Value::as_str)
-                .is_some_and(|s| s.to_lowercase().contains(&needle.to_lowercase()))
-        });
+        let terms = needle.split_whitespace().collect::<Vec<_>>();
+        let term_matches = |term: &str| {
+            fields.iter().any(|field| {
+                doc_at_path(doc, field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.to_lowercase().contains(&term.to_lowercase()))
+            })
+        };
+        let all_terms_required = multi_match.get("operator").and_then(Value::as_str) == Some("and");
+        return if all_terms_required {
+            !terms.is_empty() && terms.iter().all(|t| term_matches(t))
+        } else {
+            terms.iter().any(|t| term_matches(t))
+        };
     }
     false
 }

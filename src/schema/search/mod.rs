@@ -5,7 +5,7 @@ mod row_filter;
 #[cfg(test)]
 mod contract;
 
-pub(crate) use operator::{build_search_filter_input, nested_filter_inputs, operator_inputs};
+pub(crate) use operator::{build_search_filter_input, nested_filter_inputs, operator_inputs, query_operator_enum};
 pub(crate) use row_filter::apply_row_filters;
 
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
@@ -71,6 +71,11 @@ pub(crate) fn add_search_field(
                         .get("query")
                         .and_then(|v| v.string().ok().map(String::from))
                         .unwrap_or_default();
+                    let query_operator = ctx
+                        .args
+                        .get("queryOperator")
+                        .and_then(|v| v.enum_name().ok().map(String::from))
+                        .unwrap_or_else(|| "OR".to_string());
                     let es_query_raw = ctx
                         .args
                         .get("esQuery")
@@ -93,6 +98,7 @@ pub(crate) fn add_search_field(
                         &service,
                         &idx_cfg,
                         &query_str,
+                        &query_operator,
                         es_query_raw.as_deref(),
                         filter.as_ref(),
                         limit,
@@ -110,6 +116,10 @@ pub(crate) fn add_search_field(
             },
         )
         .argument(InputValue::new("query", TypeRef::named(TypeRef::STRING)))
+        .argument(InputValue::new(
+            "queryOperator",
+            TypeRef::named("QueryOperator"),
+        ))
         .argument(InputValue::new("esQuery", TypeRef::named(TypeRef::STRING)))
         .argument(InputValue::new(
             "filter",
@@ -131,6 +141,7 @@ pub(crate) async fn search(
     service: &SearchService,
     index_cfg: &SearchIndexConfig,
     query_str: &str,
+    query_operator: &str,
     es_query_raw: Option<&str>,
     filters: Option<&ValueAccessor<'_>>,
     limit: usize,
@@ -170,8 +181,16 @@ pub(crate) async fn search(
         let mut must_clauses = operator::build_es_filter(filters);
         must_clauses.extend(filter_clauses);
         let mut bool_body = serde_json::json!({ "must": must_clauses });
-        if !query_str.is_empty() {
-            bool_body["should"] = serde_json::json!([{ "multi_match": { "query": query_str, "fields": all_searchable, "type": "cross_fields" } }]);
+        if !query_str.trim().is_empty() {
+            let mut multi_match = serde_json::json!({
+                "query": query_str,
+                "fields": all_searchable,
+                "type": "cross_fields",
+            });
+            if query_operator == "AND" {
+                multi_match["operator"] = serde_json::json!("and");
+            }
+            bool_body["should"] = serde_json::json!([{ "multi_match": multi_match }]);
             bool_body["minimum_should_match"] = serde_json::json!(1);
         }
         bool_body
@@ -415,5 +434,130 @@ mod tests {
         let resp = run(&schema, "{ searchMaterials(limit: 1, offset: 1) { mat_no } }").await;
         assert!(resp.is_ok(), "pagination errored: {:?}", resp.errors);
         assert_eq!(mat_nos(&resp), vec!["M-2"]);
+    }
+
+    #[tokio::test]
+    async fn query_operator_and_requires_every_term_to_match() {
+        let mut cfg: crate::config::Config = crate::config::Config::from_file("config.yaml").unwrap();
+        for index in &mut cfg.search_indexes {
+            index.join_fields = Vec::new();
+        }
+        let config = Arc::new(cfg);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy(&config.database.url)
+            .unwrap();
+        let docs = vec![
+            serde_json::json!({ "mat_no": "M-1", "name": "Alpha Cotton", "status": "active" }),
+            serde_json::json!({ "mat_no": "M-2", "name": "Beta Wool", "status": "active" }),
+            serde_json::json!({ "mat_no": "M-3", "name": "Gamma Cotton Wool", "status": "discontinued" }),
+        ];
+        let service = stub_service(pool.clone(), docs);
+        let schema = build_schema_with_search(config, pool, service).await;
+
+        let resp = run(&schema, "{ searchMaterials(query: \"wool\") { mat_no } }").await;
+        assert!(resp.is_ok(), "OR query errored: {:?}", resp.errors);
+        assert_eq!(mat_nos(&resp), vec!["M-2", "M-3"]);
+
+        let resp = run(
+            &schema,
+            "{ searchMaterials(query: \"cotton wool\", queryOperator: OR) { mat_no } }",
+        )
+        .await;
+        assert!(resp.is_ok(), "OR query errored: {:?}", resp.errors);
+        assert_eq!(mat_nos(&resp), vec!["M-1", "M-2", "M-3"]);
+
+        let resp = run(
+            &schema,
+            "{ searchMaterials(query: \"cotton wool\", queryOperator: AND) { mat_no } }",
+        )
+        .await;
+        assert!(resp.is_ok(), "AND query errored: {:?}", resp.errors);
+        assert_eq!(mat_nos(&resp), vec!["M-3"]);
+
+        let resp = run(
+            &schema,
+            "{ searchMaterials(query: \"wool\", queryOperator: AND) { mat_no } }",
+        )
+        .await;
+        assert!(resp.is_ok(), "AND single-term errored: {:?}", resp.errors);
+        assert_eq!(mat_nos(&resp), vec!["M-2", "M-3"]);
+
+        let resp = run(
+            &schema,
+            "{ searchMaterials(query: \"cotton wool\") { mat_no } }",
+        )
+        .await;
+        assert!(resp.is_ok(), "default operator errored: {:?}", resp.errors);
+        assert_eq!(mat_nos(&resp), vec!["M-1", "M-2", "M-3"]);
+
+        let resp = run(
+            &schema,
+            "{ searchMaterials(query: \"\", queryOperator: AND) { mat_no } }",
+        )
+        .await;
+        assert!(resp.is_ok(), "empty query errored: {:?}", resp.errors);
+        assert_eq!(mat_nos(&resp), vec!["M-1", "M-2", "M-3"]);
+
+        let resp = run(
+            &schema,
+            "{ searchMaterials(query: \"   \", queryOperator: AND) { mat_no } }",
+        )
+        .await;
+        assert!(resp.is_ok(), "whitespace query errored: {:?}", resp.errors);
+        assert_eq!(mat_nos(&resp), vec!["M-1", "M-2", "M-3"]);
+    }
+
+    #[tokio::test]
+    async fn query_operator_and_spans_top_level_and_joined_fields() {
+        let cfg: crate::config::Config = crate::config::Config::from_file("config.yaml").unwrap();
+        let config = Arc::new(cfg);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_secs(1))
+            .connect_lazy(&config.database.url)
+            .unwrap();
+        let docs = vec![
+            serde_json::json!({
+                "mat_no": "M-1",
+                "name": "Alpha Cotton",
+                "status": "active",
+                "material_features": [
+                    { "feature_name": "Wool", "description": "insulating", "feature_attributes": [] }
+                ]
+            }),
+            serde_json::json!({
+                "mat_no": "M-2",
+                "name": "Beta",
+                "status": "active",
+                "material_features": [
+                    { "feature_name": "Wool", "description": "soft", "feature_attributes": [] }
+                ]
+            }),
+            serde_json::json!({
+                "mat_no": "M-3",
+                "name": "Gamma",
+                "status": "discontinued",
+                "material_features": [
+                    { "feature_name": "Cotton", "description": "breathable", "feature_attributes": [] }
+                ]
+            }),
+        ];
+        let service = stub_service(pool.clone(), docs);
+        let schema = build_schema_with_search(config, pool, service).await;
+
+        let resp = run(
+            &schema,
+            "{ searchMaterials(query: \"cotton wool\", queryOperator: AND) { mat_no } }",
+        )
+        .await;
+        assert!(resp.is_ok(), "AND joined errored: {:?}", resp.errors);
+        assert_eq!(mat_nos(&resp), vec!["M-1"]);
+
+        let resp = run(
+            &schema,
+            "{ searchMaterials(query: \"cotton wool\") { mat_no } }",
+        )
+        .await;
+        assert!(resp.is_ok(), "OR joined errored: {:?}", resp.errors);
+        assert_eq!(mat_nos(&resp), vec!["M-1", "M-2", "M-3"]);
     }
 }

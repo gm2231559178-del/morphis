@@ -75,6 +75,7 @@ pub(crate) async fn build_schema_with_search(
     for input_obj in search::operator_inputs() {
         schema_builder = schema_builder.register(input_obj);
     }
+    schema_builder = schema_builder.register(search::query_operator_enum());
 
     for index_cfg in &config.search_indexes {
         tracing::debug!("Registering search index: {}", index_cfg.name);
