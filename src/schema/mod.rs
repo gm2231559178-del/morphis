@@ -105,6 +105,7 @@ pub(crate) async fn build_schema_with_search(
             .get(&index_cfg.graphql_type)
             .map(|t| t.row_filters.clone())
             .unwrap_or_default();
+        schema_builder = schema_builder.register(search::build_search_hit_object(index_cfg));
         query = search::add_search_field(query, index_cfg, search_row_filters, search_service.clone());
     }
 

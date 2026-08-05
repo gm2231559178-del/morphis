@@ -254,30 +254,30 @@ POST http://localhost:4000/graphql
 Content-Type: application/json
 X-Tenant-ID: alpha
 {
-  "query": "{ searchMaterials(query: \"ES Row Filter\") { mat_no name } }"
+  "query": "{ searchMaterials(query: \"ES Row Filter\") { node { mat_no name } } }"
 }
 HTTP 200
 [Asserts]
 jsonpath "$.data.searchMaterials" count == 1
-jsonpath "$.data.searchMaterials[0].mat_no" == "ES-TEST-A"
+jsonpath "$.data.searchMaterials[0].node.mat_no" == "ES-TEST-A"
 
 # Search with X-Tenant-ID: beta — only ES-TEST-B
 POST http://localhost:4000/graphql
 Content-Type: application/json
 X-Tenant-ID: beta
 {
-  "query": "{ searchMaterials(query: \"ES Row Filter\") { mat_no name } }"
+  "query": "{ searchMaterials(query: \"ES Row Filter\") { node { mat_no name } } }"
 }
 HTTP 200
 [Asserts]
 jsonpath "$.data.searchMaterials" count == 1
-jsonpath "$.data.searchMaterials[0].mat_no" == "ES-TEST-B"
+jsonpath "$.data.searchMaterials[0].node.mat_no" == "ES-TEST-B"
 
 # Search without headers — both ES docs visible
 POST http://localhost:4000/graphql
 Content-Type: application/json
 {
-  "query": "{ searchMaterials(query: \"ES Row Filter\") { mat_no name } }"
+  "query": "{ searchMaterials(query: \"ES Row Filter\") { node { mat_no name } } }"
 }
 HTTP 200
 [Asserts]

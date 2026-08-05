@@ -12,6 +12,7 @@ use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 use tokio::sync::Mutex;
 
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, Object, TypeRef, ValueAccessor};
+use async_graphql::{Name, Value};
 use sqlx::{Pool, Postgres};
 
 use identity_auth::circuit_breaker::CircuitBreaker;
@@ -57,10 +58,11 @@ pub(crate) fn add_search_field(
 ) -> Object {
     let idx_cfg = index_cfg.clone();
     let type_name = idx_cfg.graphql_type.clone();
+    let hit_type_name = format!("{}SearchHit", type_name);
     query = query.field(
         Field::new(
             format!("search{}", capitalize_first(&idx_cfg.index)),
-            TypeRef::named_nn_list_nn(&type_name),
+            TypeRef::named_nn_list_nn(&hit_type_name),
             move |ctx| {
                 let idx_cfg = idx_cfg.clone();
                 let row_filters = row_filters.clone();
@@ -109,7 +111,12 @@ pub(crate) fn add_search_field(
                     .await?;
                     let items: Vec<FieldValue> = results
                         .into_iter()
-                        .map(|r| FieldValue::value(gql_val(r)))
+                        .map(|(source, score)| {
+                            FieldValue::value(gql_val(serde_json::json!({
+                                "node": source,
+                                "score": score,
+                            })))
+                        })
                         .collect();
                     Ok(Some(FieldValue::list(items)))
                 })
@@ -134,8 +141,49 @@ pub(crate) fn add_search_field(
     query
 }
 
+/// The per-index hit object type for a search index: `node` carries the matched
+/// document and `score` the Elasticsearch relevance score.
+pub(crate) fn build_search_hit_object(index_cfg: &SearchIndexConfig) -> Object {
+    let type_name = index_cfg.graphql_type.clone();
+    let hit_type_name = format!("{}SearchHit", type_name);
+    let node_type = type_name.clone();
+
+    let node_field = Field::new("node", TypeRef::named_nn(node_type), move |ctx| {
+        FieldFuture::new(async move {
+            let parent = ctx
+                .parent_value
+                .as_value()
+                .ok_or_else(|| async_graphql::Error::new("not a value"))?;
+            let val = match parent {
+                Value::Object(map) => map.get(&Name::new("node")).cloned().unwrap_or(Value::Null),
+                _ => Value::Null,
+            };
+            Ok(Some(FieldValue::value(val)))
+        })
+    });
+
+    let score_field = Field::new("score", TypeRef::named_nn(TypeRef::FLOAT), |ctx| {
+        FieldFuture::new(async move {
+            let parent = ctx
+                .parent_value
+                .as_value()
+                .ok_or_else(|| async_graphql::Error::new("not a value"))?;
+            let val = match parent {
+                Value::Object(map) => map.get(&Name::new("score")).cloned().unwrap_or(Value::Null),
+                _ => Value::Null,
+            };
+            Ok(Some(FieldValue::value(val)))
+        })
+    });
+
+    Object::new(&hit_type_name)
+        .field(node_field)
+        .field(score_field)
+}
+
 /// Single interface for the search module: a query against one index config
-/// returns the hits the filter semantics say it should.
+/// returns the hits the filter semantics say it should, each paired with the
+/// relevance score Elasticsearch assigned it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn search(
     service: &SearchService,
@@ -148,7 +196,7 @@ pub(crate) async fn search(
     offset: usize,
     identity: Option<&Identity>,
     row_filters: &[RowFilterConfig],
-) -> Result<Vec<serde_json::Value>, async_graphql::Error> {
+) -> Result<Vec<(serde_json::Value, f64)>, async_graphql::Error> {
     tracing::debug!(
         index = %index_cfg.index,
         query = %query_str.chars().take(80).collect::<String>(),
@@ -212,17 +260,21 @@ pub(crate) async fn search(
 
     let hits = body["hits"]["hits"].as_array().cloned().unwrap_or_default();
 
-    let mut results: Vec<serde_json::Value> = hits
-        .into_iter()
+    let mut sources: Vec<serde_json::Value> = hits
+        .iter()
         .map(|hit| {
             hit.get("_source")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null)
         })
         .collect();
+    let scores: Vec<f64> = hits
+        .iter()
+        .map(|hit| hit.get("_score").and_then(serde_json::Value::as_f64).unwrap_or(0.0))
+        .collect();
 
-    es_batch_enrich(&service.pool, &mut results, &index_cfg.join_fields).await?;
-    Ok(results)
+    es_batch_enrich(&service.pool, &mut sources, &index_cfg.join_fields).await?;
+    Ok(sources.into_iter().zip(scores).collect())
 }
 
 fn collect_searchable_fields(cfg: &SearchIndexConfig) -> Vec<String> {
@@ -343,7 +395,7 @@ mod tests {
             .as_array()
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|v| v["mat_no"].as_str().map(String::from))
+                    .filter_map(|v| v["node"]["mat_no"].as_str().map(String::from))
                     .collect()
             })
             .unwrap_or_default()
@@ -379,45 +431,45 @@ mod tests {
         let service = stub_service(pool.clone(), docs);
         let schema = build_schema_with_search(config, pool, service).await;
 
-        let resp = run(&schema, "{ searchMaterials(filter: { status: { eq: \"active\" } }) { mat_no } }").await;
+        let resp = run(&schema, "{ searchMaterials(filter: { status: { eq: \"active\" } }) { node { mat_no } } }").await;
         assert!(resp.is_ok(), "eq filter errored: {:?}", resp.errors);
         assert_eq!(mat_nos(&resp), vec!["M-1", "M-2"]);
 
         let resp = run(
             &schema,
-            "{ searchMaterials(filter: { mat_no: { in: [\"M-1\", \"M-3\"] } }) { mat_no } }",
+            "{ searchMaterials(filter: { mat_no: { in: [\"M-1\", \"M-3\"] } }) { node { mat_no } } }",
         )
         .await;
         assert!(resp.is_ok(), "in filter errored: {:?}", resp.errors);
         assert_eq!(mat_nos(&resp), vec!["M-1", "M-3"]);
 
         let resp =
-            run(&schema, "{ searchMaterials(filter: { name: { contains: \"et\" } }) { mat_no } }")
+            run(&schema, "{ searchMaterials(filter: { name: { contains: \"et\" } }) { node { mat_no } } }")
                 .await;
         assert!(resp.is_ok(), "contains filter errored: {:?}", resp.errors);
         assert_eq!(mat_nos(&resp), vec!["M-2"]);
 
         let resp = run(
             &schema,
-            "{ searchMaterials(filter: { name: { starts_with: \"Ga\" } }) { mat_no } }",
+            "{ searchMaterials(filter: { name: { starts_with: \"Ga\" } }) { node { mat_no } } }",
         )
         .await;
         assert!(resp.is_ok(), "starts_with filter errored: {:?}", resp.errors);
         assert_eq!(mat_nos(&resp), vec!["M-3"]);
 
         let resp =
-            run(&schema, "{ searchMaterials(filter: { status: { ne: \"active\" } }) { mat_no } }")
+            run(&schema, "{ searchMaterials(filter: { status: { ne: \"active\" } }) { node { mat_no } } }")
                 .await;
         assert!(resp.is_ok(), "ne filter errored: {:?}", resp.errors);
         assert_eq!(mat_nos(&resp), vec!["M-3"]);
 
-        let resp = run(&schema, "{ searchMaterials(query: \"alpha\") { mat_no } }").await;
+        let resp = run(&schema, "{ searchMaterials(query: \"alpha\") { node { mat_no } } }").await;
         assert!(resp.is_ok(), "query text errored: {:?}", resp.errors);
         assert_eq!(mat_nos(&resp), vec!["M-1"]);
 
         let resp = run(
             &schema,
-            "{ searchMaterials(esQuery: \"{\\\"term\\\":{\\\"mat_no.keyword\\\":\\\"M-2\\\"}}\") { mat_no } }",
+            "{ searchMaterials(esQuery: \"{\\\"term\\\":{\\\"mat_no.keyword\\\":\\\"M-2\\\"}}\") { node { mat_no } } }",
         )
         .await;
         assert!(resp.is_ok(), "raw esQuery errored: {:?}", resp.errors);
@@ -425,13 +477,13 @@ mod tests {
 
         let resp = run(
             &schema,
-            "{ searchMaterials(esQuery: \"{\\\"range\\\":{\\\"count\\\":{\\\"gte\\\":10}}}\") { mat_no } }",
+            "{ searchMaterials(esQuery: \"{\\\"range\\\":{\\\"count\\\":{\\\"gte\\\":10}}}\") { node { mat_no } } }",
         )
         .await;
         assert!(resp.is_ok(), "raw range errored: {:?}", resp.errors);
         assert_eq!(mat_nos(&resp), vec!["M-2"]);
 
-        let resp = run(&schema, "{ searchMaterials(limit: 1, offset: 1) { mat_no } }").await;
+        let resp = run(&schema, "{ searchMaterials(limit: 1, offset: 1) { node { mat_no } } }").await;
         assert!(resp.is_ok(), "pagination errored: {:?}", resp.errors);
         assert_eq!(mat_nos(&resp), vec!["M-2"]);
     }
@@ -454,21 +506,25 @@ mod tests {
         let service = stub_service(pool.clone(), docs);
         let schema = build_schema_with_search(config, pool, service).await;
 
-        let resp = run(&schema, "{ searchMaterials(query: \"wool\") { mat_no } }").await;
+        let resp = run(&schema, "{ searchMaterials(query: \"wool\") { node { mat_no } } }").await;
         assert!(resp.is_ok(), "OR query errored: {:?}", resp.errors);
         assert_eq!(mat_nos(&resp), vec!["M-2", "M-3"]);
 
         let resp = run(
             &schema,
-            "{ searchMaterials(query: \"cotton wool\", queryOperator: OR) { mat_no } }",
+            "{ searchMaterials(query: \"cotton wool\", queryOperator: OR) { node { mat_no } } }",
         )
         .await;
         assert!(resp.is_ok(), "OR query errored: {:?}", resp.errors);
-        assert_eq!(mat_nos(&resp), vec!["M-1", "M-2", "M-3"]);
+        assert_eq!(
+            mat_nos(&resp),
+            vec!["M-3", "M-1", "M-2"],
+            "both terms matched ranks first"
+        );
 
         let resp = run(
             &schema,
-            "{ searchMaterials(query: \"cotton wool\", queryOperator: AND) { mat_no } }",
+            "{ searchMaterials(query: \"cotton wool\", queryOperator: AND) { node { mat_no } } }",
         )
         .await;
         assert!(resp.is_ok(), "AND query errored: {:?}", resp.errors);
@@ -476,7 +532,7 @@ mod tests {
 
         let resp = run(
             &schema,
-            "{ searchMaterials(query: \"wool\", queryOperator: AND) { mat_no } }",
+            "{ searchMaterials(query: \"wool\", queryOperator: AND) { node { mat_no } } }",
         )
         .await;
         assert!(resp.is_ok(), "AND single-term errored: {:?}", resp.errors);
@@ -484,15 +540,19 @@ mod tests {
 
         let resp = run(
             &schema,
-            "{ searchMaterials(query: \"cotton wool\") { mat_no } }",
+            "{ searchMaterials(query: \"cotton wool\") { node { mat_no } } }",
         )
         .await;
         assert!(resp.is_ok(), "default operator errored: {:?}", resp.errors);
-        assert_eq!(mat_nos(&resp), vec!["M-1", "M-2", "M-3"]);
+        assert_eq!(
+            mat_nos(&resp),
+            vec!["M-3", "M-1", "M-2"],
+            "default OR ranks best match first"
+        );
 
         let resp = run(
             &schema,
-            "{ searchMaterials(query: \"\", queryOperator: AND) { mat_no } }",
+            "{ searchMaterials(query: \"\", queryOperator: AND) { node { mat_no } } }",
         )
         .await;
         assert!(resp.is_ok(), "empty query errored: {:?}", resp.errors);
@@ -500,7 +560,7 @@ mod tests {
 
         let resp = run(
             &schema,
-            "{ searchMaterials(query: \"   \", queryOperator: AND) { mat_no } }",
+            "{ searchMaterials(query: \"   \", queryOperator: AND) { node { mat_no } } }",
         )
         .await;
         assert!(resp.is_ok(), "whitespace query errored: {:?}", resp.errors);
@@ -546,7 +606,7 @@ mod tests {
 
         let resp = run(
             &schema,
-            "{ searchMaterials(query: \"cotton wool\", queryOperator: AND) { mat_no } }",
+            "{ searchMaterials(query: \"cotton wool\", queryOperator: AND) { node { mat_no } } }",
         )
         .await;
         assert!(resp.is_ok(), "AND joined errored: {:?}", resp.errors);
@@ -554,10 +614,57 @@ mod tests {
 
         let resp = run(
             &schema,
-            "{ searchMaterials(query: \"cotton wool\") { mat_no } }",
+            "{ searchMaterials(query: \"cotton wool\") { node { mat_no } } }",
         )
         .await;
         assert!(resp.is_ok(), "OR joined errored: {:?}", resp.errors);
         assert_eq!(mat_nos(&resp), vec!["M-1", "M-2", "M-3"]);
+    }
+
+    #[tokio::test]
+    async fn search_hits_expose_score_and_node() {
+        let mut cfg: crate::config::Config = crate::config::Config::from_file("config.yaml").unwrap();
+        for index in &mut cfg.search_indexes {
+            index.join_fields = Vec::new();
+        }
+        let config = Arc::new(cfg);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy(&config.database.url)
+            .unwrap();
+        let docs = vec![
+            serde_json::json!({ "mat_no": "M-1", "name": "Alpha Cotton", "status": "active" }),
+            serde_json::json!({ "mat_no": "M-2", "name": "Beta Cotton Wool", "status": "active" }),
+        ];
+        let service = stub_service(pool.clone(), docs);
+        let schema = build_schema_with_search(config, pool, service).await;
+
+        // Text query: score reflects the stub's term-count relevance and node
+        // resolves the document fields.
+        let resp = run(
+            &schema,
+            "{ searchMaterials(query: \"cotton wool\") { score node { mat_no name status } } }",
+        )
+        .await;
+        assert!(resp.is_ok(), "hit shape errored: {:?}", resp.errors);
+        let data = serde_json::to_value(&resp.data).unwrap();
+        let hits = data["searchMaterials"].as_array().unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0]["node"]["mat_no"], "M-2");
+        assert_eq!(hits[0]["node"]["name"], "Beta Cotton Wool");
+        assert_eq!(hits[0]["score"], 2.0, "both terms matched -> score 2.0");
+        assert_eq!(hits[1]["node"]["mat_no"], "M-1");
+        assert_eq!(hits[1]["score"], 1.0, "one term matched -> score 1.0");
+
+        // Filter-only query: same hit shape, constant score.
+        let resp = run(
+            &schema,
+            "{ searchMaterials(filter: { status: { eq: \"active\" } }) { score node { mat_no } } }",
+        )
+        .await;
+        assert!(resp.is_ok(), "filter-only errored: {:?}", resp.errors);
+        let data = serde_json::to_value(&resp.data).unwrap();
+        let hits = data["searchMaterials"].as_array().unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|h| h["score"] == 0.0), "filter-only scores 0.0");
     }
 }
